@@ -1,0 +1,109 @@
+name: Bazel kernel
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-kernel-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Kernel input checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 tools/bazel/kernel_action_test.py
+      - run: python3 tools/bazel/verify_cache_test.py
+      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_action.py tools/bazel/verify_cache.py
+
+  source-and-cache:
+    name: AMD64 VS kernel source and remote cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Allocate space on this disposable runner
+        run: |
+          # These preinstalled SDKs are unused: all kernel tools are declared Bazel inputs.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          python3 - <<'PY'
+          import os, shutil
+          free = shutil.disk_usage(os.environ['RUNNER_TEMP']).free
+          print(f'Free build disk: {free / 2**30:.1f} GiB')
+          if free < 45 * 2**30:
+              raise SystemExit('Kernel source/cache validation requires 45 GiB free scratch space')
+          PY
+      - name: Start an empty remote action cache
+        run: |
+          docker run -d --name sonic-kernel-cache \
+            --publish 127.0.0.1:8080:8080 \
+            buchgr/bazel-remote-cache@sha256:d9b104d02bea731f5a8ce6d3c518f814953ef54c2e0218744ce7643ff9d85ca8 \
+            --dir=/data --max_size=4 --http_address=:8080 --grpc_address=none
+      - name: Compile the kernel from declared sources
+        run: |
+          curl --fail --show-error --silent --retry 15 --retry-delay 1 \
+            --retry-connrefused --retry-all-errors --retry-max-time 30 --max-time 2 \
+            http://127.0.0.1:8080/status > "$RUNNER_TEMP/kernel-cache-before-cold.json"
+          python3 tools/bazel/build.py \
+            --workspace tools/bazel/cache-consumer \
+            --work-dir "$RUNNER_TEMP/kernel-cold" \
+            --repository-cache "$RUNNER_TEMP/kernel-downloads" \
+            --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
+            --remote-cache http://127.0.0.1:8080 \
+            --bazel-arg=--strategy=SonicKernelBuild=local
+      - name: Fetch from the remote cache in a fresh Bazel output directory
+        timeout-minutes: 10
+        run: |
+          curl --fail --show-error --silent --retry 15 --retry-delay 1 \
+            --retry-connrefused --retry-all-errors --retry-max-time 30 --max-time 2 \
+            http://127.0.0.1:8080/status > "$RUNNER_TEMP/kernel-cache-before-hit.json"
+          python3 tools/bazel/build.py \
+            --workspace tools/bazel/cache-consumer \
+            --work-dir "$RUNNER_TEMP/kernel-hit" \
+            --repository-cache "$RUNNER_TEMP/kernel-downloads" \
+            --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
+            --remote-cache http://127.0.0.1:8080 --remote-cache-read-only \
+            --bazel-arg=--strategy=SonicKernelBuild=local
+      - name: Verify compilation was skipped and packages are identical
+        run: |
+          python3 tools/bazel/verify_cache.py \
+            --cold "$RUNNER_TEMP/kernel-cold" --hit "$RUNNER_TEMP/kernel-hit" \
+            --artifacts "$RUNNER_TEMP/kernel-artifacts"
+      - name: Collect cache service diagnostics
+        if: always()
+        run: docker logs sonic-kernel-cache > "$RUNNER_TEMP/kernel-cache.log" 2>&1 || true
+      - name: Retain packages and cache evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-amd64-vs-cache-evidence
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/kernel-artifacts/*
+            ${{ runner.temp }}/kernel-cache.log
+            ${{ runner.temp }}/kernel-cache-before-*.json
+            ${{ runner.temp }}/kernel-cold/build.log
+            ${{ runner.temp }}/kernel-cold/execution.json
+            ${{ runner.temp }}/kernel-cold/bep.json
+            ${{ runner.temp }}/kernel-cold/profile.json.gz
+            ${{ runner.temp }}/kernel-cold/invocation.json
+            ${{ runner.temp }}/kernel-hit/build.log
+            ${{ runner.temp }}/kernel-hit/execution.json
+            ${{ runner.temp }}/kernel-hit/bep.json
+            ${{ runner.temp }}/kernel-hit/profile.json.gz
+            ${{ runner.temp }}/kernel-hit/invocation.json
+            tools/bazel/cache-consumer/MODULE.bazel.lock
+      - name: Stop this job's cache
+        if: always()
+        run: docker rm -f sonic-kernel-cache || true

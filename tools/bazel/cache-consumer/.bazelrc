@@ -1,0 +1,4 @@
+# Draft validation endpoint until the shared kernel tools registration lands.
+common --registry=https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-build-tools-v2
+common --registry=https://bcr.bazel.build
+common --lockfile_mode=update
