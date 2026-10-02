@@ -1,0 +1,28 @@
+load("//tools/bazel:kernel.bzl", "kernel_packages")
+
+package(default_visibility = ["//visibility:public"])
+
+kernel_packages(
+    name = "kernel_packages",
+    srcs = glob([
+        "config.local/**",
+        "patches-debian/**",
+        "patches-sonic/**",
+    ]) + [
+        "Makefile",
+        "manage-config",
+    ],
+    build_tools = "@sonic_build_infra//tools/build_tools:kernel_runtime",
+    debian = "@kernel_debian//file",
+    dsc = "@kernel_dsc//file",
+    exec_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    makefile = "Makefile",
+    orig = "@kernel_orig//file",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
