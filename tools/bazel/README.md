@@ -29,6 +29,26 @@ were freshly compiled by the consumer. The default Make path is unchanged;
 dependency check runs against the declared runtime's package status database;
 the generated SONiC control file and selected build profiles remain in effect.
 
+## Registry selection
+
+Local builds and normal CI use `sonic-bazel-registry/main`, with Bazel Central
+Registry for third-party modules. Dependency versions and source checksums stay
+pinned in the module definitions and registry entries.
+
+This Draft PR still needs the kernel tools registration in
+[registry #31](https://github.com/securely1g/sonic-bazel-registry/pull/31). Until
+that version lands, `main` cannot resolve it. The source/cache CI job explicitly
+replaces the single SONiC endpoint in its checked-out cache-consumer workspace
+with `codex/kernel-build-tools-v2` for review. It does not add a fallback registry.
+For local validation of this Draft PR, explicitly change only the SONiC URL in
+`tools/bazel/cache-consumer/.bazelrc` to that branch as well. If building the
+repository root instead, select it in the root `.bazelrc`.
+
+After the registration lands, remove the workflow's temporary registry override
+and selection step, and restore any local override to `main`. Buildimage's
+Draft kernel integration selects its own pending registration branch explicitly;
+both workspaces use `main` by default.
+
 ## Run locally
 
 The launcher needs Linux AMD64 and Docker. It runs as root **inside a disposable

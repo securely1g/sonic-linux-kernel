@@ -29,10 +29,26 @@ jobs:
     name: AMD64 VS kernel source and remote cache
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # Temporary Draft-PR validation until registry #31 publishes the kernel tools.
+    # Remove this override and the selection step once that version is on main.
+    env:
+      SONIC_BAZEL_REGISTRY: https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-build-tools-v2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Select the temporary registry branch for this Draft PR
+        run: |
+          python3 - <<'PY_REGISTRY'
+          import os
+          from pathlib import Path
+          config = Path("tools/bazel/cache-consumer/.bazelrc")
+          original = config.read_text()
+          prefix = "common --registry=https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/"
+          if [line for line in original.splitlines() if line.startswith(prefix)] != [prefix + "main"]:
+              raise SystemExit("Expected one SONiC registry entry selecting main")
+          config.write_text(original.replace(prefix + "main", "common --registry=" + os.environ["SONIC_BAZEL_REGISTRY"]))
+          PY_REGISTRY
       - name: Allocate space on this disposable runner
         run: |
           # These preinstalled SDKs are unused: all kernel tools are declared Bazel inputs.
