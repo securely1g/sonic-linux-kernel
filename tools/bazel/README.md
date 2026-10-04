@@ -36,10 +36,10 @@ Registry for third-party modules. Dependency versions and source checksums stay
 pinned in the module definitions and registry entries.
 
 This Draft PR still needs the kernel tools registration in
-[registry #31](https://github.com/securely1g/sonic-bazel-registry/pull/31). Until
+[registry #39](https://github.com/securely1g/sonic-bazel-registry/pull/39). Until
 that version lands, `main` cannot resolve it. The source/cache CI job explicitly
 replaces the single SONiC endpoint in its checked-out cache-consumer workspace
-with `codex/kernel-build-tools-v2` for review. It does not add a fallback registry.
+with `codex/kernel-build-tools-current` for review. It does not add a fallback registry.
 For local validation of this Draft PR, explicitly change only the SONiC URL in
 `tools/bazel/cache-consumer/.bazelrc` to that branch as well. If building the
 repository root instead, select it in the root `.bazelrc`.

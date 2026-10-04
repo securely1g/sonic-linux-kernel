@@ -29,10 +29,10 @@ jobs:
     name: AMD64 VS kernel source and remote cache
     runs-on: ubuntu-24.04
     timeout-minutes: 300
-    # Temporary Draft-PR validation until registry #31 publishes the kernel tools.
+    # Temporary Draft-PR validation until registry #39 publishes the kernel tools.
     # Remove this override and the selection step once that version is on main.
     env:
-      SONIC_BAZEL_REGISTRY: https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-build-tools-v2
+      SONIC_BAZEL_REGISTRY: https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-build-tools-current
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
