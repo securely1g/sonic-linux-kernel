@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check input identity and package handoff without compiling a sample kernel."""
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -51,14 +52,32 @@ class KernelActionTest(unittest.TestCase):
     def test_runtime_requires_declared_amd64_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            inputs = ["a" * 64, "b" * 64]
+            identity = hashlib.sha256(json.dumps({"architecture": "amd64", "inputs": inputs},
+                                                 sort_keys=True).encode()).hexdigest()
             marker = {"schema_version": 1, "kind": "debian-build-tools", "architecture": "arm64",
-                      "identity_sha256": "a" * 64, "packages": {"make": "4.4.1"}}
+                      "identity_sha256": identity, "input_sha256": inputs, "packages": {"make": "4.4.1"}}
             (root / "kernel-runtime.json").write_text(json.dumps(marker))
             with self.assertRaisesRegex(ValueError, "AMD64"):
                 action.runtime_identity(root)
             marker["architecture"] = "amd64"
             (root / "kernel-runtime.json").write_text(json.dumps(marker))
             self.assertEqual(action.runtime_identity(root), marker)
+            marker["input_sha256"][0] = "c" * 64
+            marker["input_sha256"].sort()
+            (root / "kernel-runtime.json").write_text(json.dumps(marker))
+            with self.assertRaisesRegex(ValueError, "identity digest"):
+                action.runtime_identity(root)
+
+    def test_action_rejects_missing_extra_and_duplicate_package_outputs(self):
+        config = {"outputs": sorted(action.PACKAGE_NAMES), "manifest": "out/kernel-packages.json"}
+        action.validate_outputs(config)
+        for outputs in (config["outputs"][:-1], config["outputs"] + ["other.deb"],
+                        [config["outputs"][0]] * 4):
+            with self.subTest(outputs=outputs), self.assertRaisesRegex(ValueError, "four supported packages"):
+                action.validate_outputs(dict(config, outputs=outputs))
+        with self.assertRaisesRegex(ValueError, "kernel-packages.json"):
+            action.validate_outputs(dict(config, manifest="out/other.json"))
 
     def test_package_metadata_must_match_filename_and_version(self):
         with tempfile.TemporaryDirectory() as directory:

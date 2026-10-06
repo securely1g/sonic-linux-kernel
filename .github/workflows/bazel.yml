@@ -22,6 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 tools/bazel/kernel_action_test.py
+      - run: python3 tools/bazel/build_test.py
       - run: python3 tools/bazel/verify_cache_test.py
       - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_action.py tools/bazel/verify_cache.py
 
@@ -114,11 +115,13 @@ jobs:
             ${{ runner.temp }}/kernel-cold/bep.json
             ${{ runner.temp }}/kernel-cold/profile.json.gz
             ${{ runner.temp }}/kernel-cold/invocation.json
+            ${{ runner.temp }}/kernel-cold/module-graph.*
             ${{ runner.temp }}/kernel-hit/build.log
             ${{ runner.temp }}/kernel-hit/execution.json
             ${{ runner.temp }}/kernel-hit/bep.json
             ${{ runner.temp }}/kernel-hit/profile.json.gz
             ${{ runner.temp }}/kernel-hit/invocation.json
+            ${{ runner.temp }}/kernel-hit/module-graph.*
             tools/bazel/cache-consumer/MODULE.bazel.lock
       - name: Stop this job's cache
         if: always()

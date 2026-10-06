@@ -116,3 +116,17 @@ inputs and all output hashes, and retains the packages and a JSON receipt.
 Elapsed time alone, unchanged files, or replayed compiler log text do not prove
 that compilation was skipped. The PR workflow runs this check against a fresh
 local cache and retains its execution logs, profile and generated module lock.
+
+## Bundle provenance for Make consumers
+
+The action rejects an output declaration that differs from the four supported
+packages and checks that the declared build-tool identity matches its recorded
+input hashes. The launcher also retains `module-graph.json`, its stderr, and an
+exit-code file. A consuming bundle producer must inspect the graph and generated
+lock before accepting outputs; recording these files alone is not validation.
+
+Buildimage may use the same external-consumer graph with an explicit local
+`sonic-linux-kernel` module override bound to its kernel gitlink while the source
+and registry changes are still drafts. That mode does not claim the source pin
+is published. A registered consumer must be validated again after the source
+and registry entries land, because changing resolution can change action keys.

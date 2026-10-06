@@ -77,6 +77,15 @@ def worker_command(args, executable, name):
         "--profile=/work/profile.json.gz", "--build_event_json_file=/work/bep.json", args.target,
     ]
     query = bazel + ["cquery"] + common + ["--output=files", args.target]
+    # Retain the resolved graph separately from the build result. Consumers
+    # inspect its completeness and pins before accepting the package bundle.
+    graph_options = [option for option in common if option.startswith((
+        "--repository_cache=", "--repo_env=", "--distdir=", "--override_module=", "--registry=",
+    ))]
+    graph = bazel + ["mod", "graph"] + graph_options + [
+        "--output=json", "--extension_info=hidden", "--lockfile_mode=off",
+        "--color=no", "--curses=no",
+    ]
     script = "\n".join([
         "set -euo pipefail", "export HOME=/work/home", "mkdir -p /work/home",
         # Only this invocation's work directory is owned by the launcher.
@@ -96,6 +105,11 @@ def worker_command(args, executable, name):
         "fi",
         shlex.join(build),
         shlex.join(query) + " > /work/output-paths.relative.txt",
+        "set +e",
+        shlex.join(graph) + " > /work/module-graph.json 2> /work/module-graph.stderr",
+        "graph_status=$?",
+        "set -e",
+        "printf '%s\\n' \"$graph_status\" > /work/module-graph.exit-code",
         # The symlink points into this invocation's execution root. `bazel
         # info` does not resolve apparent platform repository names reliably.
         'execution_root=$(dirname "$(realpath /work/bazel-out)")',
@@ -140,6 +154,8 @@ def main():
     parser.add_argument("--ca-bundle", type=Path)
     parser.add_argument("--distdir", type=Path)
     args = parser.parse_args()
+    if os.uname().sysname != "Linux" or os.uname().machine != "x86_64":
+        parser.error("kernel source builds require native Linux AMD64 execution")
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}", args.worker_image):
         parser.error("--worker-image requires an immutable image digest")
     if not (args.workspace / "MODULE.bazel").is_file():

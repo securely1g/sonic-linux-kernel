@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
@@ -12,6 +13,12 @@ import stat
 import tempfile
 
 SOURCE_DATE_EPOCH = 1754969284  # Debian linux 6.12.41-1 changelog timestamp.
+PACKAGE_NAMES = {
+    "linux-headers-6.12.41+deb13-common-sonic_6.12.41-1_all.deb",
+    "linux-headers-6.12.41+deb13-sonic-amd64_6.12.41-1_amd64.deb",
+    "linux-image-6.12.41+deb13-sonic-amd64-unsigned_6.12.41-1_amd64.deb",
+    "linux-kbuild-6.12.41+deb13_6.12.41-1_amd64.deb",
+}
 
 
 def require(condition, message):
@@ -32,8 +39,17 @@ def runtime_identity(runtime):
     require(marker.get("schema_version") == 1 and marker.get("kind") == "debian-build-tools",
             "unsupported declared build-tools runtime")
     require(marker.get("architecture") == "amd64", "kernel tools must execute on AMD64")
-    require(len(marker.get("identity_sha256", "")) == 64 and marker.get("packages"),
+    inputs = marker.get("input_sha256")
+    require(isinstance(inputs, list) and inputs
+            and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in inputs)
+            and inputs == sorted(inputs)
+            and isinstance(marker.get("packages"), dict) and marker["packages"]
+            and all(isinstance(name, str) and isinstance(version, str) and name and version
+                    for name, version in marker["packages"].items()),
             "missing build-tools provenance")
+    expected = hashlib.sha256(json.dumps({"architecture": "amd64", "inputs": inputs},
+                                         sort_keys=True).encode()).hexdigest()
+    require(marker.get("identity_sha256") == expected, "build-tools identity digest differs from its inputs")
     return marker
 
 
@@ -97,8 +113,20 @@ def package_record(path, root):
             "architecture": values["Architecture"]}
 
 
+def validate_outputs(config):
+    outputs = config.get("outputs")
+    require(isinstance(outputs, list) and len(outputs) == len(PACKAGE_NAMES)
+            and all(isinstance(name, str) and name for name in outputs)
+            and {Path(name).name for name in outputs} == PACKAGE_NAMES,
+            "kernel action must declare exactly the four supported packages")
+    require(isinstance(config.get("manifest"), str)
+            and Path(config["manifest"]).name == "kernel-packages.json",
+            "kernel action must declare kernel-packages.json")
+
+
 def build(config):
     require(config.get("schema") == 1, "unsupported kernel action schema")
+    validate_outputs(config)
     require(os.geteuid() == 0, "kernel action requires root in its disposable worker for chroot")
     runtime = Path(config["build_tools"])
     marker = runtime_identity(runtime)

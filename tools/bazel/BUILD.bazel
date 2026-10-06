@@ -24,3 +24,12 @@ py_test(
     ],
     main = "verify_cache_test.py",
 )
+
+py_test(
+    name = "build_test",
+    srcs = [
+        "build.py",
+        "build_test.py",
+    ],
+    main = "build_test.py",
+)
