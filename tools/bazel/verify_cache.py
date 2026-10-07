@@ -97,7 +97,15 @@ def main():
     parser.add_argument("--hit", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
     args = parser.parse_args()
-    print(json.dumps(verify(args.cold, args.hit, args.artifacts), indent=2))
+    receipt = verify(args.cold, args.hit, args.artifacts)
+    # The full receipt stays in the private destination. CLI output contains no
+    # arbitrary execution metrics, environment values, or output paths.
+    print(json.dumps({
+        "result": receipt["result"], "cold_compiled": receipt["cold_compiled"],
+        "consumer_kernel_cache_hit": receipt["consumer_kernel_cache_hit"],
+        "kernel_compilation_skipped": receipt["kernel_compilation_skipped"],
+        "verified_output_count": len(receipt["outputs_sha256"]),
+    }, indent=2))
 
 
 if __name__ == "__main__":

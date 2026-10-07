@@ -2,6 +2,8 @@ load("//tools/bazel:kernel.bzl", "kernel_packages")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files([".github/workflows/bazel.yml"])
+
 kernel_packages(
     name = "kernel_packages",
     srcs = glob([

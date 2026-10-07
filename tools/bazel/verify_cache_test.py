@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Reject cache evidence that could hide local reuse or changed outputs."""
 
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -56,6 +58,23 @@ class CacheProofTest(unittest.TestCase):
                 (root / "output-paths.txt").write_text(output + "\n")
                 with self.assertRaises(ValueError):
                     proof.outputs(root)
+
+
+    def test_cli_omits_arbitrary_execution_fields(self):
+        sentinel = "SENSITIVE_FIXTURE_DO_NOT_PUBLISH"
+        receipt = {"result": "passed", "cold_compiled": True, "consumer_kernel_cache_hit": True,
+                   "kernel_compilation_skipped": True, "outputs_sha256": {sentinel: "digest"},
+                   "cold_metrics": {"environment": sentinel}, "hit_metrics": {"diagnostic": sentinel}}
+        output = io.StringIO()
+        with patch.object(proof, "verify", return_value=receipt), \
+                patch.object(sys, "argv", ["verify", "--cold", "/tmp/cold", "--hit", "/tmp/hit", "--artifacts", "/tmp/artifacts"]), \
+                contextlib.redirect_stdout(output):
+            proof.main()
+        self.assertNotIn(sentinel, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue()), {
+            "result": "passed", "cold_compiled": True, "consumer_kernel_cache_hit": True,
+            "kernel_compilation_skipped": True, "verified_output_count": 1,
+        })
 
 
 if __name__ == "__main__":

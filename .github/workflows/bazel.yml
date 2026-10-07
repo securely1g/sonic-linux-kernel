@@ -24,7 +24,8 @@ jobs:
       - run: python3 tools/bazel/kernel_action_test.py
       - run: python3 tools/bazel/build_test.py
       - run: python3 tools/bazel/verify_cache_test.py
-      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_action.py tools/bazel/verify_cache.py
+      - run: python3 tools/bazel/collect_ci_artifacts_test.py
+      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_action.py tools/bazel/verify_cache.py tools/bazel/collect_ci_artifacts.py
 
   source-and-cache:
     name: AMD64 VS kernel source and remote cache
@@ -38,17 +39,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Select the temporary registry branch for this Draft PR
+      - name: Prepare private consumers and select the temporary registry branch
         run: |
           python3 - <<'PY_REGISTRY'
           import os
           from pathlib import Path
-          config = Path("tools/bazel/cache-consumer/.bazelrc")
-          original = config.read_text()
+          import shutil
+          os.umask(0o077)
+          root = Path(os.environ["RUNNER_TEMP"]) / "kernel-private"
+          root.mkdir(mode=0o700)
+          template = Path("tools/bazel/cache-consumer")
           prefix = "common --registry=https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/"
+          original = (template / ".bazelrc").read_text()
           if [line for line in original.splitlines() if line.startswith(prefix)] != [prefix + "main"]:
               raise SystemExit("Expected one SONiC registry entry selecting main")
-          config.write_text(original.replace(prefix + "main", "common --registry=" + os.environ["SONIC_BAZEL_REGISTRY"]))
+          selected = original.replace(prefix + "main", "common --registry=" + os.environ["SONIC_BAZEL_REGISTRY"])
+          for run in ("cold", "hit"):
+              consumer = root / (run + "-consumer")
+              consumer.mkdir()
+              for name in ("BUILD.bazel", "MODULE.bazel"):
+                  source = template / name
+                  if not source.is_file() or source.is_symlink():
+                      raise SystemExit("Expected regular consumer template files")
+                  shutil.copyfile(source, consumer / name)
+              (consumer / ".bazelrc").write_text(selected)
           PY_REGISTRY
       - name: Allocate space on this disposable runner
         run: |
@@ -63,66 +77,108 @@ jobs:
           PY
       - name: Start an empty remote action cache
         run: |
-          docker run -d --name sonic-kernel-cache \
+          umask 077
+          if docker run -d --name sonic-kernel-cache \
             --publish 127.0.0.1:8080:8080 \
             buchgr/bazel-remote-cache@sha256:d9b104d02bea731f5a8ce6d3c518f814953ef54c2e0218744ce7643ff9d85ca8 \
-            --dir=/data --max_size=4 --http_address=:8080 --grpc_address=none
+            --dir=/data --max_size=4 --http_address=:8080 --grpc_address=none \
+            > "$RUNNER_TEMP/kernel-private/cache-start.log" 2>&1; then
+            echo "Started the empty loopback action cache."
+          else
+            status=$?
+            echo "Cache startup failed with exit code $status."
+            exit "$status"
+          fi
       - name: Compile the kernel from declared sources
         run: |
-          curl --fail --show-error --silent --retry 15 --retry-delay 1 \
+          umask 077
+          if curl --fail --show-error --silent --retry 15 --retry-delay 1 \
             --retry-connrefused --retry-all-errors --retry-max-time 30 --max-time 2 \
-            http://127.0.0.1:8080/status > "$RUNNER_TEMP/kernel-cache-before-cold.json"
-          python3 tools/bazel/build.py \
-            --workspace tools/bazel/cache-consumer \
-            --work-dir "$RUNNER_TEMP/kernel-cold" \
-            --repository-cache "$RUNNER_TEMP/kernel-downloads" \
+            http://127.0.0.1:8080/status > "$RUNNER_TEMP/kernel-private/cache-before-cold.json" \
+            2> "$RUNNER_TEMP/kernel-private/cold-cache-probe.log"; then
+            echo "The empty action cache is ready."
+          else
+            status=$?
+            echo "Cache status probe failed with exit code $status."
+            exit "$status"
+          fi
+          if python3 tools/bazel/build.py \
+            --workspace "$RUNNER_TEMP/kernel-private/cold-consumer" \
+            --work-dir "$RUNNER_TEMP/kernel-private/cold" \
+            --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
+            --target @sonic_linux_kernel//:kernel_packages \
             --remote-cache http://127.0.0.1:8080 \
-            --bazel-arg=--strategy=SonicKernelBuild=local
+            --bazel-arg=--strategy=SonicKernelBuild=local \
+            > "$RUNNER_TEMP/kernel-private/cold-launcher.log" 2>&1; then
+            echo "Kernel source command completed."
+          else
+            status=$?
+            echo "Kernel source command failed with exit code $status."
+            exit "$status"
+          fi
       - name: Fetch from the remote cache in a fresh Bazel output directory
         timeout-minutes: 10
         run: |
-          curl --fail --show-error --silent --retry 15 --retry-delay 1 \
+          umask 077
+          if curl --fail --show-error --silent --retry 15 --retry-delay 1 \
             --retry-connrefused --retry-all-errors --retry-max-time 30 --max-time 2 \
-            http://127.0.0.1:8080/status > "$RUNNER_TEMP/kernel-cache-before-hit.json"
-          python3 tools/bazel/build.py \
-            --workspace tools/bazel/cache-consumer \
-            --work-dir "$RUNNER_TEMP/kernel-hit" \
-            --repository-cache "$RUNNER_TEMP/kernel-downloads" \
+            http://127.0.0.1:8080/status > "$RUNNER_TEMP/kernel-private/cache-before-hit.json" \
+            2> "$RUNNER_TEMP/kernel-private/hit-cache-probe.log"; then
+            echo "The action cache is ready for the fresh consumer."
+          else
+            status=$?
+            echo "Cache status probe failed with exit code $status."
+            exit "$status"
+          fi
+          if python3 tools/bazel/build.py \
+            --workspace "$RUNNER_TEMP/kernel-private/hit-consumer" \
+            --work-dir "$RUNNER_TEMP/kernel-private/hit" \
+            --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
+            --target @sonic_linux_kernel//:kernel_packages \
             --remote-cache http://127.0.0.1:8080 --remote-cache-read-only \
-            --bazel-arg=--strategy=SonicKernelBuild=local
+            --bazel-arg=--strategy=SonicKernelBuild=local \
+            > "$RUNNER_TEMP/kernel-private/hit-launcher.log" 2>&1; then
+            echo "Kernel cache consumer command completed."
+          else
+            status=$?
+            echo "Kernel cache consumer command failed with exit code $status."
+            exit "$status"
+          fi
       - name: Verify compilation was skipped and packages are identical
         run: |
-          python3 tools/bazel/verify_cache.py \
-            --cold "$RUNNER_TEMP/kernel-cold" --hit "$RUNNER_TEMP/kernel-hit" \
-            --artifacts "$RUNNER_TEMP/kernel-artifacts"
-      - name: Collect cache service diagnostics
+          umask 077
+          if python3 tools/bazel/verify_cache.py \
+            --cold "$RUNNER_TEMP/kernel-private/cold" --hit "$RUNNER_TEMP/kernel-private/hit" \
+            --artifacts "$RUNNER_TEMP/kernel-private/verified" \
+            > "$RUNNER_TEMP/kernel-private/verify.log" 2>&1; then
+            echo "Kernel source and cache verification passed."
+          else
+            status=$?
+            echo "Kernel source and cache verification failed with exit code $status."
+            exit "$status"
+          fi
+      - name: Collect private cache service diagnostics
         if: always()
-        run: docker logs sonic-kernel-cache > "$RUNNER_TEMP/kernel-cache.log" 2>&1 || true
-      - name: Retain packages and cache evidence
+        run: docker logs sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache.log" 2>&1 || true
+      - name: Create public-safe packages and evidence
+        id: collect
         if: always()
+        env:
+          KERNEL_JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 tools/bazel/collect_ci_artifacts.py \
+            --private-root "$RUNNER_TEMP/kernel-private" --source-root "$GITHUB_WORKSPACE" \
+            --output "$RUNNER_TEMP/kernel-artifacts" --job-status "$KERNEL_JOB_STATUS"
+      - name: Retain packages and allowlisted cache evidence
+        if: always() && steps.collect.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kernel-amd64-vs-cache-evidence
           retention-days: 7
-          path: |
-            ${{ runner.temp }}/kernel-artifacts/*
-            ${{ runner.temp }}/kernel-cache.log
-            ${{ runner.temp }}/kernel-cache-before-*.json
-            ${{ runner.temp }}/kernel-cold/build.log
-            ${{ runner.temp }}/kernel-cold/execution.json
-            ${{ runner.temp }}/kernel-cold/bep.json
-            ${{ runner.temp }}/kernel-cold/profile.json.gz
-            ${{ runner.temp }}/kernel-cold/invocation.json
-            ${{ runner.temp }}/kernel-cold/module-graph.*
-            ${{ runner.temp }}/kernel-hit/build.log
-            ${{ runner.temp }}/kernel-hit/execution.json
-            ${{ runner.temp }}/kernel-hit/bep.json
-            ${{ runner.temp }}/kernel-hit/profile.json.gz
-            ${{ runner.temp }}/kernel-hit/invocation.json
-            ${{ runner.temp }}/kernel-hit/module-graph.*
-            tools/bazel/cache-consumer/MODULE.bazel.lock
+          if-no-files-found: error
+          path: ${{ runner.temp }}/kernel-artifacts
       - name: Stop this job's cache
         if: always()
-        run: docker rm -f sonic-kernel-cache || true
+        run: docker rm -f sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache-stop.log" 2>&1 || true

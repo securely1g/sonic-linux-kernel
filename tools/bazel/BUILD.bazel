@@ -33,3 +33,14 @@ py_test(
     ],
     main = "build_test.py",
 )
+
+py_test(
+    name = "collect_ci_artifacts_test",
+    srcs = [
+        "collect_ci_artifacts.py",
+        "collect_ci_artifacts_test.py",
+        "kernel_action.py",
+    ],
+    data = ["//:.github/workflows/bazel.yml"],
+    main = "collect_ci_artifacts_test.py",
+)

@@ -38,8 +38,9 @@ pinned in the module definitions and registry entries.
 This Draft PR still needs the kernel tools registration in
 [registry #39](https://github.com/securely1g/sonic-bazel-registry/pull/39). Until
 that version lands, `main` cannot resolve it. The source/cache CI job explicitly
-replaces the single SONiC endpoint in its checked-out cache-consumer workspace
-with `codex/kernel-build-tools-current` for review. It does not add a fallback registry.
+replaces the single SONiC endpoint in two private cache-consumer copies
+with `codex/kernel-build-tools-current` for review. Each copy starts without a
+generated module lock. It does not add a fallback registry.
 For local validation of this Draft PR, explicitly change only the SONiC URL in
 `tools/bazel/cache-consumer/.bazelrc` to that branch as well. If building the
 repository root instead, select it in the root `.bazelrc`.
@@ -115,7 +116,41 @@ execution record to report `remote cache hit`. It compares declared action
 inputs and all output hashes, and retains the packages and a JSON receipt.
 Elapsed time alone, unchanged files, or replayed compiler log text do not prove
 that compilation was skipped. The PR workflow runs this check against a fresh
-local cache and retains its execution logs, profile and generated module lock.
+local cache, separate consumer workspaces, and distinct Bazel output directories.
+
+## CI artifact handling
+
+The source/cache job keeps launcher output, build logs, execution records, BEP,
+profiles, cache diagnostics, generated module locks, and raw module graphs in an
+owner-only job directory. The launcher and verifier output are captured there;
+the job log prints fixed status messages and numeric exit codes. Raw diagnostic
+files are not uploaded.
+
+After both builds and the cache verifier pass, `collect_ci_artifacts.py` creates
+a new artifact directory containing only the four verified DEBs,
+`kernel-packages.json`, `validation.json`, and `resolution.json`. It validates
+the manifest's complete field set, package metadata and hashes, build-tool
+identity, and source inventory and archive records against the checkout before
+copying the five Bazel outputs. Duplicate JSON keys, symlinks, unexpected fields,
+and an existing destination are rejected.
+
+`validation.json` records the checkout revision, bounded target configuration,
+verified cache result, output hashes, and allowlisted numeric action metrics.
+`resolution.json` retains the complete selected module graph and selected
+registry file hashes for the allowed public Bazel Central and SONiC endpoints.
+It labels the explicit kernel source override and the temporary SONiC draft
+registry separately. The collector requires successful graph inspection and
+matching selected module graphs and registry records across the two runs.
+Generated module extension state, arbitrary environment fields, unselected
+registry lookups, raw URLs, paths, logs, BEP, and profiles are omitted. This
+redacted resolution summary is evidence of the selected modules, not a reusable
+`MODULE.bazel.lock`; the raw generated lock remains private job scratch.
+
+If an earlier step fails or is cancelled, the collector publishes only a fixed
+status summary with presence flags for known private evidence files. The job
+keeps its failure status. Upload runs only after the collector succeeds, so an
+unsafe input or a partial collection cannot publish an existing directory.
+The focused collector tests use fake bytes and do not create Debian packages.
 
 ## Bundle provenance for Make consumers
 
