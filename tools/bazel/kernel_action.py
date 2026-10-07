@@ -97,20 +97,39 @@ def checkout_source_identity(checkout):
     ]))
 
 
-def package_record(path, root):
+def package_record(path, root, *, exported=True):
+    require(path.is_file() and not path.is_symlink(), "kernel package must be a regular file: " + str(path))
+    relative = path.resolve().relative_to(root.resolve())
     metadata = in_chroot(
-        root, ["/usr/bin/dpkg-deb", "-f", "/build/packages/" + path.name,
+        root, ["/usr/bin/dpkg-deb", "-f", "/" + str(relative),
                "Package", "Version", "Architecture"], check=True, capture_output=True, text=True,
     ).stdout
     values = dict(line.split(": ", 1) for line in metadata.splitlines())
     expected_arch = "all" if "common-sonic" in path.name else "amd64"
-    require(values["Version"] == "6.12.41-1" and values["Architecture"] == expected_arch,
+    require(values["Version"] == "6.12.41-1" and values["Architecture"] in ("all", "amd64")
+            and (not exported or values["Architecture"] == expected_arch),
             "kernel package version or architecture differs from target: " + path.name)
     require(path.name == f'{values["Package"]}_{values["Version"]}_{values["Architecture"]}.deb',
             "kernel package filename differs from its control metadata")
     return {"name": path.name, "sha256": sha256(path), "size": path.stat().st_size,
             "package": values["Package"], "version": values["Version"],
             "architecture": values["Architecture"]}
+
+
+def created_package_records(root, source, destination):
+    """Record every DEB left by dpkg-buildpackage before private scratch cleanup."""
+    records = {}
+    # The existing Make recipe builds DEBs in its source directory and moves
+    # the four exported files to DEST. Both directories start empty here.
+    for directory in (source, destination):
+        for path in sorted(directory.glob("*.deb")):
+            record = package_record(path, root, exported=path.name in PACKAGE_NAMES)
+            record["exported"] = path.name in PACKAGE_NAMES
+            if path.name in records:
+                require(records[path.name] == record, "duplicate kernel package bytes differ: " + path.name)
+            records[path.name] = record
+    require(PACKAGE_NAMES <= records.keys(), "kernel build omitted required packages from its created inventory")
+    return [records[name] for name in sorted(records)]
 
 
 def validate_outputs(config):
@@ -174,12 +193,18 @@ def build(config):
             "SECURE_UPGRADE_MODE=no_sign", "SECURE_UPGRADE_KERNEL_CAFILE=",
             "SONIC_CONFIG_MAKE_JOBS=4", "ADDITIONAL_BUILD_PROFILES=",
         ], env=environment, check=True)
+        print("SONIC_KERNEL_PACKAGE_INVENTORY_STARTED", flush=True)
+        created_packages = created_package_records(root, source, dest)
+        print("SONIC_KERNEL_CREATED_PACKAGES " + json.dumps(created_packages, sort_keys=True), flush=True)
+        created_by_name = {record["name"]: record for record in created_packages}
         packages = []
         for name in config["outputs"]:
             output = Path(name)
             package = dest / output.name
             require(package.is_file(), "kernel build omitted required package: " + package.name)
-            packages.append(package_record(package, root))
+            record = dict(created_by_name[output.name])
+            record.pop("exported")
+            packages.append(record)
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(package, output)
         manifest = {
@@ -191,6 +216,7 @@ def build(config):
             "source_tree_sha256": source_tree_sha256(inventory),
             "source_files": inventory,
             "build_tools": marker,
+            "created_packages": created_packages,
             "packages": sorted(packages, key=lambda entry: entry["name"]),
         }
         Path(config["manifest"]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

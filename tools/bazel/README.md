@@ -130,3 +130,12 @@ Buildimage may use the same external-consumer graph with an explicit local
 and registry changes are still drafts. That mode does not claim the source pin
 is published. A registered consumer must be validated again after the source
 and registry entries land, because changing resolution can change action keys.
+
+## Created package inventory
+
+`kernel-packages.json` also records `created_packages`: every DEB left by the
+existing `dpkg-buildpackage` recipe in the private source directory or moved to
+`DEST`, with control metadata, size, SHA-256 and an `exported` flag. The action
+hashes these files before its temporary directory is removed. The four declared
+DEBs remain the exported package set; internal package bytes are not retained.
+A cache hit reuses the producer's inventory in the cached manifest.

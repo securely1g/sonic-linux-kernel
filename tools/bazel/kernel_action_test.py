@@ -79,14 +79,40 @@ class KernelActionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "kernel-packages.json"):
             action.validate_outputs(dict(config, manifest="out/other.json"))
 
+    def test_created_inventory_captures_internal_packages_and_rejects_conflicting_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "build/source", root / "build/packages"
+            source.mkdir(parents=True)
+            destination.mkdir()
+            for name in action.PACKAGE_NAMES:
+                (destination / name).write_bytes(b"exported package fixture")
+            internal = "linux-image-6.12.41+deb13-sonic-amd64-dbg_6.12.41-1_amd64.deb"
+            (source / internal).write_bytes(b"internal package fixture")
+
+            def record(path, _root, *, exported):
+                return {"name": path.name, "sha256": action.sha256(path), "size": path.stat().st_size}
+
+            with patch.object(action, "package_record", side_effect=record):
+                records = action.created_package_records(root, source, destination)
+                self.assertEqual(len(records), 5)
+                self.assertEqual({item["name"] for item in records if item["exported"]}, action.PACKAGE_NAMES)
+                self.assertEqual([item["name"] for item in records if not item["exported"]], [internal])
+                duplicate = next(iter(action.PACKAGE_NAMES))
+                (source / duplicate).write_bytes(b"different package fixture")
+                with self.assertRaisesRegex(ValueError, "duplicate kernel package bytes differ"):
+                    action.created_package_records(root, source, destination)
+
     def test_package_metadata_must_match_filename_and_version(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = root / "linux-kbuild-6.12.41+deb13_6.12.41-1_amd64.deb"
+            path = root / "build/source/linux-kbuild-6.12.41+deb13_6.12.41-1_amd64.deb"
+            path.parent.mkdir(parents=True)
             path.write_bytes(b"only metadata is mocked; this is not a DEB")
             with patch.object(action, "in_chroot") as child:
                 child.return_value.stdout = "Package: linux-kbuild-6.12.41+deb13\nVersion: 6.12.41-1\nArchitecture: amd64\n"
                 self.assertEqual(action.package_record(path, root)["name"], path.name)
+                self.assertEqual(child.call_args.args[1][2], "/build/source/" + path.name)
                 child.return_value.stdout = "Package: linux-kbuild-6.12.41+deb13\nVersion: 6.12.41-2\nArchitecture: amd64\n"
                 with self.assertRaisesRegex(ValueError, "version or architecture"):
                     action.package_record(path, root)
