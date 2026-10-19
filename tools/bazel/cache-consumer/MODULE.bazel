@@ -3,4 +3,4 @@
 module(name = "sonic-kernel-cache-consumer")
 
 bazel_dep(name = "sonic-linux-kernel", version = "0.0.1", repo_name = "sonic_linux_kernel")
-bazel_dep(name = "sonic-build-infra", version = "0.0.16-fed771f1ba011367f4e6b015071696529bbb48a8", repo_name = "sonic_build_infra")
+bazel_dep(name = "sonic-build-infra", version = "0.0.16-717519d972fe8405e4e7dec424de3058e8952b14", repo_name = "sonic_build_infra")
