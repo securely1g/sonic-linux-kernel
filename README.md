@@ -26,7 +26,7 @@ Usage:
 
 If DEST is not set, package will stay in current directory.
 
-The optional [Bazel source build](tools/bazel/README.md) produces the AMD64 VS
+The optional [Bazel source build](tools/bazel/README.md) produces native AMD64 and ARM64 VS
 kernel runtime, debug and development TARs and supports sharing them through a Bazel
 remote action cache.
 

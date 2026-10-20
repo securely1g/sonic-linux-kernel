@@ -30,7 +30,7 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def fixture(root):
+def fixture(root, architecture="amd64"):
     private = root / "private"
     verified = private / "verified"
     verified.mkdir(parents=True)
@@ -41,7 +41,7 @@ def fixture(root):
         )
     ], key=lambda item: item["name"])
     records = []
-    abi = artifacts.CONFIGURATION["kernel_abi"]
+    abi = artifacts.configuration(architecture)["kernel_abi"]
     members = {
         "runtime": ["boot/vmlinuz-" + abi, "boot/config-" + abi,
                     "usr/lib/modules/" + abi + "/kernel/example.ko.xz"],
@@ -66,15 +66,15 @@ def fixture(root):
         content = (verified / name).read_bytes()
         records.append({"name": name, "kind": kind, "sha256": digest(content), "size": len(content)})
     inputs = [digest(b"tool")]
-    tools = {"schema_version": 1, "kind": "debian-build-tools", "architecture": "amd64",
+    tools = {"schema_version": 1, "kind": "debian-build-tools", "architecture": architecture,
              "input_sha256": inputs, "packages": {"python3": "3.13.5-1"},
-             "identity_sha256": digest(json.dumps({"architecture": "amd64", "inputs": inputs}, sort_keys=True).encode())}
-    manifest = {**artifacts.CONFIGURATION, "source_archives": archives, "source_files": inventory,
+             "identity_sha256": digest(json.dumps({"architecture": architecture, "inputs": inputs}, sort_keys=True).encode())}
+    manifest = {**artifacts.configuration(architecture), "source_archives": archives, "source_files": inventory,
                 "source_tree_sha256": kernel_action.source_tree_sha256(inventory), "build_tools": tools,
                 "artifacts": records, "debug": {"kernel_build_id": "12" * 20, "module_count": 1,
                     "module_build_ids_sha256": digest(b"module-build-ids")}}
     write_json(verified / artifacts.MANIFEST, manifest)
-    proof = {"schema": 1, "result": "passed", "cold_compiled": True,
+    proof = {"schema": 1, "architecture": architecture, "result": "passed", "cold_compiled": True,
              "consumer_kernel_runner": "remote cache hit", "consumer_kernel_cache_hit": True,
              "kernel_compilation_skipped": True,
              "outputs_sha256": {path.name: digest(path.read_bytes()) for path in verified.iterdir()},
@@ -102,7 +102,7 @@ def fixture(root):
         for name in ("build.log", "execution.json", "bep.json", "profile.json.gz", "invocation.json"):
             (private / run / name).write_text(SENTINEL)
     write_json(private / "debugger.json", {
-        "schema": 1, "result": "passed", "gdb": "GNU gdb (Debian 16.3-1) 16.3",
+        "schema": 1, "result": "passed", "architecture": architecture, "gdb": "GNU gdb (Debian 16.3-1) 16.3",
         "kernel": {"function": "start_kernel", "source": "debian/build/source_sonic/init/main.c",
                    "line": 900, "type_lookup": True},
         "module": {"function": "dummy_init", "source": "debian/build/source_sonic/drivers/net/dummy.c",
@@ -114,9 +114,9 @@ def fixture(root):
 
 
 class ArtifactTest(unittest.TestCase):
-    def collect(self, private, expected, output, status="success"):
+    def collect(self, private, expected, output, status="success", architecture="amd64"):
         with patch.object(artifacts, "checkout_inputs", return_value=expected):
-            return artifacts.collect(private, private.parent / "source", output, status)
+            return artifacts.collect(private, private.parent / "source", output, status, architecture)
 
     def update_manifest(self, private, change):
         path = private / "verified" / artifacts.MANIFEST
@@ -152,6 +152,47 @@ class ArtifactTest(unittest.TestCase):
             self.assertTrue(resolution["module_extension_state_redacted"])
             self.assertEqual(len(resolution["modules"]), 3)
             self.assertEqual(resolution["cold"]["omitted_registry_entry_count"], 1)
+
+    def test_arm64_artifacts_match_the_requested_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private, expected = fixture(root, "arm64")
+            result = self.collect(private, expected, root / "public", architecture="arm64")
+            self.assertEqual(result, {"result": "passed", "published_file_count": 6})
+            validation = json.loads((root / "public/validation.json").read_text())
+            self.assertEqual(validation["configuration"]["architecture"], "arm64")
+            self.assertEqual(validation["configuration"]["kernel_abi"], kernel_action.kernel_abi("arm64"))
+            self.assertEqual(validation["cache_proof"]["architecture"], "arm64")
+            self.assertEqual(validation["debugger"]["architecture"], "arm64")
+
+    def test_rejects_architecture_mismatches_in_tools_cache_and_debugger(self):
+        for mismatch in ("requested", "tools", "proof", "debugger"):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                private, expected = fixture(root, "arm64")
+                if mismatch == "tools":
+                    def change(manifest):
+                        tools = manifest["build_tools"]
+                        tools["architecture"] = "amd64"
+                        tools["identity_sha256"] = digest(json.dumps(
+                            {"architecture": "amd64", "inputs": tools["input_sha256"]}, sort_keys=True).encode())
+                    self.update_manifest(private, change)
+                elif mismatch in ("proof", "debugger"):
+                    path = private / ("verified/cache-proof.json" if mismatch == "proof" else "debugger.json")
+                    receipt = json.loads(path.read_text())
+                    receipt["architecture"] = "amd64"
+                    write_json(path, receipt)
+                with self.assertRaises(artifacts.CollectionError):
+                    self.collect(private, expected, root / "public",
+                                 architecture="amd64" if mismatch == "requested" else "arm64")
+                self.assertFalse((root / "public").exists())
+
+    def test_rejects_a_tar_containing_another_architectures_abi(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private, _expected = fixture(root, "amd64")
+            with self.assertRaisesRegex(artifacts.CollectionError, "runtime TAR lacks kernel"):
+                artifacts.validate_tar(private / "verified/kernel-runtime.tar", "runtime", "arm64")
 
     def test_rejects_unknown_manifest_fields_even_with_matching_hashes(self):
         changes = (

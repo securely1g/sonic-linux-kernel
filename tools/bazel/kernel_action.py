@@ -12,6 +12,8 @@ import sys
 import stat
 import tempfile
 
+from kernel_arch import ARCHITECTURES, kernel_abi, kernel_architecture, validate_architecture
+
 SOURCE_DATE_EPOCH = 1754969284  # Debian linux 6.12.41-1 changelog timestamp.
 ARTIFACT_KINDS = {
     "kernel-runtime.tar": "runtime",
@@ -19,7 +21,7 @@ ARTIFACT_KINDS = {
     "kernel-development.tar": "development",
 }
 ARTIFACT_NAMES = set(ARTIFACT_KINDS)
-EXTRA_SOURCES = ("tools/bazel/stage_kernel.py", "tools/bazel/stage-kernel.mk")
+EXTRA_SOURCES = ("tools/bazel/kernel_arch.py", "tools/bazel/stage_kernel.py", "tools/bazel/stage-kernel.mk")
 
 
 
@@ -36,11 +38,12 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def runtime_identity(runtime):
+def runtime_identity(runtime, architecture="amd64"):
+    validate_architecture(architecture)
     marker = json.loads((runtime / "kernel-runtime.json").read_text())
     require(marker.get("schema_version") == 1 and marker.get("kind") == "debian-build-tools",
             "unsupported declared build-tools runtime")
-    require(marker.get("architecture") == "amd64", "kernel tools must execute on AMD64")
+    require(marker.get("architecture") == architecture, "kernel tools must execute on " + architecture.upper())
     inputs = marker.get("input_sha256")
     require(isinstance(inputs, list) and inputs
             and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in inputs)
@@ -49,7 +52,7 @@ def runtime_identity(runtime):
             and all(isinstance(name, str) and isinstance(version, str) and name and version
                     for name, version in marker["packages"].items()),
             "missing build-tools provenance")
-    expected = hashlib.sha256(json.dumps({"architecture": "amd64", "inputs": inputs},
+    expected = hashlib.sha256(json.dumps({"architecture": architecture, "inputs": inputs},
                                          sort_keys=True).encode()).hexdigest()
     require(marker.get("identity_sha256") == expected, "build-tools identity digest differs from its inputs")
     return marker
@@ -100,6 +103,7 @@ def checkout_source_identity(checkout):
 
 
 def validate_outputs(config):
+    validate_architecture(config.get("architecture", "amd64"))
     outputs = config.get("outputs")
     require(isinstance(outputs, list) and len(outputs) == len(ARTIFACT_NAMES)
             and all(isinstance(name, str) and name for name in outputs)
@@ -110,32 +114,36 @@ def validate_outputs(config):
             "kernel action must declare kernel-artifacts.json")
 
 
-def compilation_commands():
+def compilation_commands(architecture="amd64"):
     """Only source/configuration/build/install targets; never binary packages."""
+    validate_architecture(architecture)
     kernel = "/build/source/linux-6.12.41"
     return [
         ["/usr/bin/dpkg-source", "-x", "/build/archives/linux_6.12.41-1.dsc", kernel],
         ["/bin/cp", "-a", "/build/source/config.local", "/build/source/patches-sonic", kernel + "/debian/"],
         ["/usr/bin/patch", "-d", kernel, "-p1", "-i", "/build/source/patches-debian/disable-secureboot-config-checks.patch"],
         ["/bin/bash", "-ec", "cd " + kernel +
-         " && if test -f debian/config.local/amd64/config.sonic-vs; then "
-         "cp debian/config.local/amd64/config.sonic-vs debian/config.local/amd64/config.sonic-platform-specific; fi"
-         " && /build/source/manage-config amd64 no_sign '' && debian/bin/gencontrol.py"],
+         f" && if test -f debian/config.local/{architecture}/config.sonic-vs; then "
+         f"cp debian/config.local/{architecture}/config.sonic-vs debian/config.local/{architecture}/config.sonic-platform-specific; fi"
+         f" && /build/source/manage-config {architecture} no_sign '' && debian/bin/gencontrol.py"],
         ["/usr/bin/make", "-C", kernel, "-f", "debian/rules.gen", "-j4",
-         "build-arch_amd64_sonic_amd64_image", "build-arch_amd64_kbuild"],
+         f"build-arch_{architecture}_sonic_{architecture}_image", f"build-arch_{architecture}_kbuild"],
         ["/usr/bin/make", "-C", kernel, "-f", "/build/source/tools/bazel/stage-kernel.mk",
-         "sonic-install-kbuild", "ABINAME=6.12.41+deb13", "ARCH=amd64", "KERNEL_ARCH=x86",
+         "sonic-install-kbuild", "ABINAME=6.12.41+deb13", "ARCH=" + architecture,
+         "KERNEL_ARCH=" + kernel_architecture(architecture),
          "VERSION=6.12", "SOURCEVERSION=6.12.41-1", "DESTDIR=/build/stage/development"],
-        ["/usr/bin/python3", "/build/source/tools/bazel/stage_kernel.py", kernel, "/build/stage", "/build/artifacts"],
+        ["/usr/bin/python3", "/build/source/tools/bazel/stage_kernel.py", kernel, "/build/stage", "/build/artifacts",
+         "--architecture", architecture],
     ]
 
 
 def build(config):
     require(config.get("schema") == 2, "unsupported kernel action schema")
     validate_outputs(config)
+    architecture = config.get("architecture", "amd64")
     require(os.geteuid() == 0, "kernel action requires root in its disposable worker for chroot")
     runtime = Path(config["build_tools"])
-    marker = runtime_identity(runtime)
+    marker = runtime_identity(runtime, architecture)
     # The tool tree is a declared input. Copy it before building so no action
     # mutates the shared runtime. Chroot makes Kbuild's /build path independent
     # of the Bazel output base, checkout path, and host tool installation.
@@ -172,7 +180,7 @@ def build(config):
             "INCLUDE_EXTERNAL_PATCHES": "n",
         }
         print("SONIC_KERNEL_COMPILATION_STARTED", flush=True)
-        for command in compilation_commands():
+        for command in compilation_commands(architecture):
             in_chroot(root, command, env=environment, check=True)
         # A source build may read declared Debian inputs, but must create no DEBs.
         require(not any(path.suffix in (".deb", ".udeb", ".ddeb") for path in source.rglob("*")),
@@ -187,8 +195,8 @@ def build(config):
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(artifact, output)
         manifest = {
-            "schema": 2, "architecture": "amd64", "platform": "vs",
-            "kernel_version": "6.12.41", "kernel_abi": "6.12.41+deb13-sonic-amd64",
+            "schema": 2, "architecture": architecture, "platform": "vs",
+            "kernel_version": "6.12.41", "kernel_abi": kernel_abi(architecture),
             "package_version": "6.12.41-1", "signing": "unsigned",
             "source_date_epoch": SOURCE_DATE_EPOCH,
             "source_archives": sorted(archive_records, key=lambda entry: entry["name"]),

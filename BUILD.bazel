@@ -4,31 +4,50 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([".github/workflows/bazel.yml"])
 
-kernel_artifacts(
+_KERNEL_SOURCES = glob([
+    "config.local/**",
+    "patches-debian/**",
+    "patches-sonic/**",
+]) + [
+    "Makefile",
+    "manage-config",
+    "//tools/bazel:kernel_arch.py",
+    "//tools/bazel:stage-kernel.mk",
+    "//tools/bazel:stage_kernel.py",
+]
+
+# Debian's source recipe builds natively: execution and target must agree.
+[
+    kernel_artifacts(
+        name = "kernel_artifacts_" + architecture,
+        srcs = _KERNEL_SOURCES,
+        architecture = architecture,
+        build_tools = "@sonic_build_infra//tools/build_tools:kernel_runtime",
+        debian = "@kernel_debian//file",
+        dsc = "@kernel_dsc//file",
+        exec_compatible_with = [
+            "@platforms//os:linux",
+            "@platforms//cpu:" + cpu,
+        ],
+        makefile = "Makefile",
+        orig = "@kernel_orig//file",
+        target_compatible_with = [
+            "@platforms//os:linux",
+            "@platforms//cpu:" + cpu,
+        ],
+    )
+    for architecture, cpu in [
+        ("amd64", "x86_64"),
+        ("arm64", "aarch64"),
+    ]
+]
+
+alias(
     name = "kernel_artifacts",
-    srcs = glob([
-        "config.local/**",
-        "patches-debian/**",
-        "patches-sonic/**",
-    ]) + [
-        "Makefile",
-        "manage-config",
-        "//tools/bazel:stage-kernel.mk",
-        "//tools/bazel:stage_kernel.py",
-    ],
-    build_tools = "@sonic_build_infra//tools/build_tools:kernel_runtime",
-    debian = "@kernel_debian//file",
-    dsc = "@kernel_dsc//file",
-    exec_compatible_with = [
-        "@platforms//os:linux",
-        "@platforms//cpu:x86_64",
-    ],
-    makefile = "Makefile",
-    orig = "@kernel_orig//file",
-    target_compatible_with = [
-        "@platforms//os:linux",
-        "@platforms//cpu:x86_64",
-    ],
+    actual = select({
+        "@platforms//cpu:x86_64": ":kernel_artifacts_amd64",
+        "@platforms//cpu:aarch64": ":kernel_artifacts_arm64",
+    }),
 )
 
 # Consumers can select a single deployable layer from the same compiled kernel.

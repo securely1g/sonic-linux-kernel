@@ -21,7 +21,7 @@ def record(hit=False, runner="local"):
             "inputs": [{"path": "config", "digest": {"hash": "same"}}]}
 
 
-def outputs_fixture(root):
+def outputs_fixture(root, architecture="amd64"):
     root.mkdir(parents=True, exist_ok=True)
     names = sorted(proof.ARTIFACT_KINDS)
     records = []
@@ -34,9 +34,11 @@ def outputs_fixture(root):
             archive.addfile(member, io.BytesIO(data))
         records.append({"name": name, "kind": proof.ARTIFACT_KINDS[name],
                         "size": path.stat().st_size, "sha256": proof.sha256(path)})
-    (root / proof.MANIFEST).write_text(json.dumps({"schema": 2, "artifacts": records}))
+    (root / proof.MANIFEST).write_text(json.dumps({
+        "schema": 2, "architecture": architecture, "kernel_abi": proof.kernel_abi(architecture), "artifacts": records,
+    }))
     (root / "output-paths.txt").write_text("\n".join("/work/" + name for name in names + [proof.MANIFEST]))
-    (root / "invocation.json").write_text(json.dumps({"disk_cache": None}))
+    (root / "invocation.json").write_text(json.dumps({"disk_cache": None, "architecture": architecture}))
 
 
 class CacheProofTest(unittest.TestCase):
@@ -80,17 +82,42 @@ class CacheProofTest(unittest.TestCase):
 
 
     def test_accepts_identical_tar_outputs_from_remote_cache(self):
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cold, hit = root / "cold", root / "hit"
+                for path, action in ((cold, record()), (hit, record(True, "remote cache hit"))):
+                    outputs_fixture(path, architecture)
+                    (path / "execution.json").write_text(json.dumps(action))
+                receipt = proof.verify(cold, hit, root / "evidence", architecture)
+                self.assertEqual(receipt["architecture"], architecture)
+                self.assertEqual(set(receipt["outputs_sha256"]), set(proof.ARTIFACT_KINDS) | {proof.MANIFEST})
+                self.assertTrue(receipt["kernel_compilation_skipped"])
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    proof.verify(cold, hit, root / "evidence", architecture)
+
+    def test_rejects_wrong_manifest_architecture_or_abi(self):
+        for field in ("architecture", "kernel_abi"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                outputs_fixture(root, "arm64")
+                path = root / proof.MANIFEST
+                manifest = json.loads(path.read_text())
+                manifest[field] = "amd64" if field == "architecture" else proof.kernel_abi("amd64")
+                path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, "architecture or ABI"):
+                    proof.outputs(root, "arm64")
+
+    def test_rejects_mixed_invocation_architectures(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cold, hit = root / "cold", root / "hit"
             for path, action in ((cold, record()), (hit, record(True, "remote cache hit"))):
-                outputs_fixture(path)
+                outputs_fixture(path, "arm64")
                 (path / "execution.json").write_text(json.dumps(action))
-            receipt = proof.verify(cold, hit, root / "evidence")
-            self.assertEqual(set(receipt["outputs_sha256"]), set(proof.ARTIFACT_KINDS) | {proof.MANIFEST})
-            self.assertTrue(receipt["kernel_compilation_skipped"])
-            with self.assertRaisesRegex(ValueError, "already exists"):
-                proof.verify(cold, hit, root / "evidence")
+            (hit / "invocation.json").write_text(json.dumps({"disk_cache": None, "architecture": "amd64"}))
+            with self.assertRaisesRegex(ValueError, "invocation architecture"):
+                proof.verify(cold, hit, root / "evidence", "arm64")
 
     def test_rejects_changed_tar_manifest_and_symlink_outputs(self):
         for change in ("bytes", "duplicate", "kind", "symlink", "schema"):
@@ -131,7 +158,7 @@ class CacheProofTest(unittest.TestCase):
 
     def test_cli_omits_arbitrary_execution_fields(self):
         sentinel = "SENSITIVE_FIXTURE_DO_NOT_PUBLISH"
-        receipt = {"result": "passed", "cold_compiled": True, "consumer_kernel_cache_hit": True,
+        receipt = {"result": "passed", "architecture": "amd64", "cold_compiled": True, "consumer_kernel_cache_hit": True,
                    "kernel_compilation_skipped": True, "outputs_sha256": {sentinel: "digest"},
                    "cold_metrics": {"environment": sentinel}, "hit_metrics": {"diagnostic": sentinel}}
         output = io.StringIO()
@@ -141,7 +168,7 @@ class CacheProofTest(unittest.TestCase):
             proof.main()
         self.assertNotIn(sentinel, output.getvalue())
         self.assertEqual(json.loads(output.getvalue()), {
-            "result": "passed", "cold_compiled": True, "consumer_kernel_cache_hit": True,
+            "result": "passed", "architecture": "amd64", "cold_compiled": True, "consumer_kernel_cache_hit": True,
             "kernel_compilation_skipped": True, "verified_output_count": 1,
         })
 

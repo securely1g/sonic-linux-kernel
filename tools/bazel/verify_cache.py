@@ -9,6 +9,8 @@ import shutil
 import re
 import tarfile
 
+from kernel_action import ARCHITECTURES, kernel_abi
+
 
 def require(condition, message):
     if not condition:
@@ -63,7 +65,7 @@ def unique_object(pairs):
     return result
 
 
-def outputs(directory):
+def outputs(directory, architecture="amd64"):
     found = {}
     for line in (directory / "output-paths.txt").read_text().splitlines():
         relative = PurePosixPath(line).relative_to("/work")
@@ -79,6 +81,8 @@ def outputs(directory):
     manifest = json.loads(found[MANIFEST].read_text(), object_pairs_hook=unique_object)
     require(type(manifest.get("schema")) is int and manifest["schema"] == 2,
             "expected TAR manifest schema 2")
+    require(manifest.get("architecture") == architecture and manifest.get("kernel_abi") == kernel_abi(architecture),
+            "kernel manifest architecture or ABI differs from cache proof")
     records = manifest.get("artifacts")
     require(isinstance(records, list) and len(records) == 3, "manifest must describe three TARs")
     names = []
@@ -100,7 +104,8 @@ def outputs(directory):
     return found
 
 
-def verify(cold, hit, destination):
+def verify(cold, hit, destination, architecture="amd64"):
+    kernel_abi(architecture)
     require(cold.resolve() != hit.resolve(), "cache proof requires distinct Bazel output directories")
     first, second = kernel_record(cold), kernel_record(hit)
     require(first.get("cacheHit") is False, "producer did not execute kernel compilation")
@@ -111,7 +116,9 @@ def verify(cold, hit, destination):
     for directory in (cold, hit):
         invocation = json.loads((directory / "invocation.json").read_text())
         require(invocation.get("disk_cache") is None, "cache proof must disable the disk cache")
-    first_outputs, second_outputs = outputs(cold), outputs(hit)
+        require(invocation.get("architecture", "amd64") == architecture,
+                "cache proof invocation architecture differs from " + architecture.upper())
+    first_outputs, second_outputs = outputs(cold, architecture), outputs(hit, architecture)
     hashes = {name: sha256(path) for name, path in first_outputs.items()}
     require(hashes == {name: sha256(path) for name, path in second_outputs.items()},
             "cached TARs differ from freshly compiled TARs")
@@ -119,7 +126,7 @@ def verify(cold, hit, destination):
     destination.mkdir(parents=True)
     for name, path in second_outputs.items():
         shutil.copyfile(path, destination / name)
-    receipt = {"schema": 1, "result": "passed", "cold_compiled": True,
+    receipt = {"schema": 1, "result": "passed", "architecture": architecture, "cold_compiled": True,
                "consumer_kernel_runner": second["runner"], "consumer_kernel_cache_hit": True,
                "kernel_compilation_skipped": True, "outputs_sha256": hashes,
                "cold_metrics": first.get("metrics"), "hit_metrics": second.get("metrics")}
@@ -132,12 +139,13 @@ def main():
     parser.add_argument("--cold", required=True, type=Path)
     parser.add_argument("--hit", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--architecture", choices=ARCHITECTURES, default="amd64")
     args = parser.parse_args()
-    receipt = verify(args.cold, args.hit, args.artifacts)
+    receipt = verify(args.cold, args.hit, args.artifacts, args.architecture)
     # The full receipt stays in the private destination. CLI output contains no
     # arbitrary execution metrics, environment values, or output paths.
     print(json.dumps({
-        "result": receipt["result"], "cold_compiled": receipt["cold_compiled"],
+        "result": receipt["result"], "architecture": receipt["architecture"], "cold_compiled": receipt["cold_compiled"],
         "consumer_kernel_cache_hit": receipt["consumer_kernel_cache_hit"],
         "kernel_compilation_skipped": receipt["kernel_compilation_skipped"],
         "verified_output_count": len(receipt["outputs_sha256"]),

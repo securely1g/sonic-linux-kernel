@@ -49,6 +49,11 @@ MODULE_NAME = re.compile(r"[a-z][a-z0-9._-]{0,127}")
 MODULE_VERSION = re.compile(r"[0-9][A-Za-z0-9.+_-]{0,127}")
 
 
+def configuration(architecture):
+    return {**CONFIGURATION, "architecture": architecture,
+            "kernel_abi": kernel_action.kernel_abi(architecture)}
+
+
 class CollectionError(ValueError):
     """A fixed-message artifact policy failure."""
 
@@ -149,10 +154,10 @@ def validate_artifact(record):
             "invalid artifact size or digest")
 
 
-def validate_tar(path, kind, *, debugger_sources=()):
+def validate_tar(path, kind, architecture="amd64", *, debugger_sources=()):
     """Check the actual archive namespace without extracting or executing files."""
     names, regular, links, modules = set(), set(), {}, set()
-    abi = CONFIGURATION["kernel_abi"]
+    abi = configuration(architecture)["kernel_abi"]
     with tarfile.open(path, mode="r:") as archive:
         for member in archive:
             raw = PurePosixPath(member.name)
@@ -218,9 +223,10 @@ def validate_tar(path, kind, *, debugger_sources=()):
     return modules
 
 
-def validate_manifest(manifest, inventory, archives):
+def validate_manifest(manifest, inventory, archives, architecture="amd64"):
     require(isinstance(manifest, dict) and set(manifest) == MANIFEST_KEYS, "unexpected manifest fields")
-    require(all(type(manifest[key]) is type(value) and manifest[key] == value for key, value in CONFIGURATION.items()),
+    require(all(type(manifest[key]) is type(value) and manifest[key] == value
+                for key, value in configuration(architecture).items()),
             "manifest differs from the supported kernel configuration")
     require(manifest["source_files"] == inventory
             and manifest["source_tree_sha256"] == kernel_action.source_tree_sha256(inventory)
@@ -231,11 +237,11 @@ def validate_manifest(manifest, inventory, archives):
     }, "unexpected build-tools fields")
     inputs = tools["input_sha256"]
     require(type(tools["schema_version"]) is int and tools["schema_version"] == 1
-            and tools["kind"] == "debian-build-tools" and tools["architecture"] == "amd64"
+            and tools["kind"] == "debian-build-tools" and tools["architecture"] == architecture
             and isinstance(inputs, list) and 0 < len(inputs) <= 4096
             and all(isinstance(value, str) and DIGEST.fullmatch(value) for value in inputs)
             and inputs == sorted(inputs), "invalid build-tools identity")
-    expected_identity = hashlib.sha256(json.dumps({"architecture": "amd64", "inputs": inputs}, sort_keys=True).encode()).hexdigest()
+    expected_identity = hashlib.sha256(json.dumps({"architecture": architecture, "inputs": inputs}, sort_keys=True).encode()).hexdigest()
     require(tools["identity_sha256"] == expected_identity, "build-tools identity differs from its inputs")
     packages = tools["packages"]
     require(isinstance(packages, dict) and 0 < len(packages) <= 4096 and all(
@@ -260,10 +266,11 @@ def validate_manifest(manifest, inventory, archives):
             and DIGEST.fullmatch(debug["module_build_ids_sha256"]), "invalid debug verification")
 
 
-def public_debugger(private):
+def public_debugger(private, architecture="amd64"):
     result = read_json(file_at(private, "debugger.json"), 16 * 1024)
-    require(isinstance(result, dict) and set(result) == {"schema", "result", "gdb", "kernel", "module"}
-            and type(result["schema"]) is int and result["schema"] == 1 and result["result"] == "passed",
+    require(isinstance(result, dict) and set(result) == {"schema", "result", "architecture", "gdb", "kernel", "module"}
+            and type(result["schema"]) is int and result["schema"] == 1 and result["result"] == "passed"
+            and result["architecture"] == architecture,
             "installed debugger verification did not pass")
     require(isinstance(result["gdb"], str) and re.fullmatch(
         r"GNU gdb(?: \([A-Za-z0-9 .+~:-]{1,128}\))? [0-9][A-Za-z0-9.+~:-]{0,63}", result["gdb"]),
@@ -303,19 +310,20 @@ def safe_metrics(value):
     return result
 
 
-def public_proof(private):
+def public_proof(private, architecture="amd64"):
     proof = read_json(file_at(private, "verified/cache-proof.json"), 1024 * 1024)
     require(isinstance(proof, dict) and type(proof.get("schema")) is int and proof["schema"] == 1
             and proof.get("result") == "passed" and proof.get("cold_compiled") is True
             and proof.get("consumer_kernel_runner") == "remote cache hit"
-            and proof.get("consumer_kernel_cache_hit") is True and proof.get("kernel_compilation_skipped") is True,
+            and proof.get("consumer_kernel_cache_hit") is True and proof.get("kernel_compilation_skipped") is True
+            and proof.get("architecture") == architecture,
             "cache verification did not pass")
     hashes = proof.get("outputs_sha256")
     names = kernel_action.ARTIFACT_NAMES | {MANIFEST}
     require(isinstance(hashes, dict) and set(hashes) == names and all(
         isinstance(value, str) and DIGEST.fullmatch(value) for value in hashes.values()), "invalid cache output digests")
     return {
-        "cold_compiled": True, "consumer_kernel_runner": "remote cache hit",
+        "architecture": architecture, "cold_compiled": True, "consumer_kernel_runner": "remote cache hit",
         "consumer_kernel_cache_hit": True, "kernel_compilation_skipped": True,
         "outputs_sha256": hashes, "cold_metrics": safe_metrics(proof.get("cold_metrics")),
         "hit_metrics": safe_metrics(proof.get("hit_metrics")),
@@ -416,7 +424,8 @@ def write_json(directory, name, value):
     path.chmod(0o600)
 
 
-def collect(private, source, output, job_status):
+def collect(private, source, output, job_status, architecture="amd64"):
+    expected_configuration = configuration(architecture)
     private, output = Path(private), Path(output)
     require(job_status in ("success", "failure", "cancelled"), "invalid job status")
     require(not output.exists() and not output.is_symlink(), "artifact destination already exists")
@@ -432,9 +441,9 @@ def collect(private, source, output, job_status):
             revision, inventory, archives = checkout_inputs(source)
             manifest_path = file_at(private, "verified/" + MANIFEST)
             manifest = read_json(manifest_path, 4 * 1024 * 1024)
-            validate_manifest(manifest, inventory, archives)
-            proof = public_proof(private)
-            debugger = public_debugger(private)
+            validate_manifest(manifest, inventory, archives, architecture)
+            proof = public_proof(private, architecture)
+            debugger = public_debugger(private, architecture)
             module_sets = {}
             for name in sorted(kernel_action.ARTIFACT_NAMES | {MANIFEST}):
                 path = file_at(private, "verified/" + name)
@@ -444,7 +453,8 @@ def collect(private, source, output, job_status):
                     require(path.stat().st_size == record["size"] and proof["outputs_sha256"][name] == record["sha256"],
                             "verified artifact differs from manifest")
                     module_sets[record["kind"]] = validate_tar(
-                        path, record["kind"], debugger_sources=[debugger[key]["source"] for key in ("kernel", "module")])
+                        path, record["kind"], architecture,
+                        debugger_sources=[debugger[key]["source"] for key in ("kernel", "module")])
                 destination = temporary / name
                 shutil.copyfile(path, destination)
                 destination.chmod(0o600)
@@ -455,7 +465,7 @@ def collect(private, source, output, job_status):
                              for name in module_sets["debug"]}
             require(runtime_modules == debug_modules and len(runtime_modules) == manifest["debug"]["module_count"],
                     "runtime and debug module inventories differ")
-            expected_debug_module = CONFIGURATION["kernel_abi"] + "/" + debugger["module"]["path"]
+            expected_debug_module = expected_configuration["kernel_abi"] + "/" + debugger["module"]["path"]
             require(expected_debug_module in debug_modules, "debugger module is absent from debug TAR")
             cold, cold_summary = redacted_resolution(private, "cold")
             hit, hit_summary = redacted_resolution(private, "hit")
@@ -469,7 +479,7 @@ def collect(private, source, output, job_status):
             write_json(temporary, "resolution.json", resolution)
             validation.update({
                 "result": "passed", "artifacts_published": True, "checkout_revision": revision,
-                "configuration": {**CONFIGURATION, "distribution": "trixie", "target": "@sonic_linux_kernel//:kernel_artifacts"},
+                "configuration": {**expected_configuration, "distribution": "trixie", "target": "@sonic_linux_kernel//:kernel_artifacts"},
                 "cache_proof": proof, "debugger": debugger, "selected_module_count": len(cold["modules"]),
             })
         write_json(temporary, "validation.json", validation)
@@ -487,9 +497,10 @@ def main():
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--job-status", required=True, choices=("success", "failure", "cancelled"))
+    parser.add_argument("--architecture", choices=("amd64", "arm64"), default="amd64")
     args = parser.parse_args()
     try:
-        result = collect(args.private_root, args.source_root, args.output, args.job_status)
+        result = collect(args.private_root, args.source_root, args.output, args.job_status, args.architecture)
     except Exception:
         # Exception details can contain untrusted paths or JSON values. Keep CI
         # output fixed; the failed collector is never followed by artifact upload.

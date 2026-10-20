@@ -7,12 +7,15 @@ three filesystem layers with one provenance manifest:
 | --- | --- | --- |
 | `//:runtime_tar` | `kernel-runtime.tar` | `/boot/vmlinuz-*`, config, real System.map, and signed modules under `/usr/lib/modules/<ABI>` |
 | `//:debug_tar` | `kernel-debug.tar` | Matching unstripped vmlinux/modules, GNU build-ID links, patched sources and generated headers |
-| `//:development_tar` | `kernel-development.tar` | Configured common/AMD64 headers, Module.symvers, BTF, kbuild programs, and relative build/source links |
+| `//:development_tar` | `kernel-development.tar` | Configured common/native headers, Module.symvers, BTF, kbuild programs, and relative build/source links |
 | `//:manifest` | `kernel-artifacts.json` | Schema 2: source/tool identities, TAR kinds/hashes/sizes, and verified debug pairing |
 
-The supported configuration remains Debian Trixie, native AMD64 execution and
-target, VS, kernel `6.12.41-1`, ABI `6.12.41+deb13-sonic-amd64`, and an unsigned
-boot image. Other architectures, external patches and secure-upgrade signing
+Supported configurations are Debian Trixie, native AMD64 or native ARM64 execution
+and target, VS, kernel `6.12.41-1`, and an unsigned boot image. The ABI is
+`6.12.41+deb13-sonic-amd64` or `6.12.41+deb13-sonic-arm64`.
+`kernel_artifacts` selects the matching native target; output directories include
+the architecture while preserving the TAR basenames.
+Cross-compilation, other architectures, external patches and secure-upgrade signing
 remain on the existing Make path.
 
 ## Source, configuration and installation
@@ -25,7 +28,8 @@ fixed locale and source timestamp. Compilation makes no source downloads.
 
 Source extraction still uses `dpkg-source`, then the SONiC config/patch overlay,
 `manage-config`, and Debian's generated rules. Only
-`build-arch_amd64_sonic_amd64_image` and `build-arch_amd64_kbuild` are selected.
+`build-arch_<arch>_sonic_<arch>_image` and `build-arch_<arch>_kbuild` are selected,
+where `<arch>` is `amd64` or `arm64`.
 Debian's `build_image` already stages the boot image, stripped signed modules,
 and original unsigned debug ELFs. `stage-kernel.mk` reuses Debian's kbuild
 **install** recipes; `stage_kernel.py` preserves Debian's configured header
@@ -50,8 +54,10 @@ Debian builds with its existing optimized configuration and
 `CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y`. The action requires DWARF in the
 original vmlinux and every debug module, compares every GNU build ID to its
 stripped runtime counterpart, and checks that runtime module signatures remain
-intact. It also extracts the ELF embedded in the boot image and compares its
-build ID with the packaged vmlinux.
+intact. On AMD64 it extracts the ELF embedded in the boot image and compares its
+build ID with the packaged vmlinux. ARM64 boots a raw `Image`; the check recreates
+that image from the same debug vmlinux using the pinned Kbuild objcopy recipe and
+requires identical bytes.
 
 Do not add a `.gnu_debuglink` after signing a module: changing its bytes would
 invalidate the signature. The debug TAR instead supplies matching GNU build-ID
@@ -62,13 +68,17 @@ the relative Debian build layout recorded by `-fdebug-prefix-map`.
 CI extracts only the runtime/debug TARs into a new root and runs:
 
 ```sh
-python3 tools/bazel/verify_debug.py --root /installed --output debugger.json
+python3 tools/bazel/verify_debug.py --architecture amd64 --root /installed --output debugger.json
 ```
 
 This check requires GDB to load the packaged build-ID symbols, resolve actual
 shipped source lines for `start_kernel` and a representative module, and inspect
 `struct task_struct`. The compiler tree is unavailable. GDB runs in a separate
-validation container; its version is recorded in the public validation summary.
+native validation container; its version and architecture are recorded in the
+public validation summary. Use `--architecture arm64` for ARM64 artifacts.
+For ARM64 kernel symbol lookup, the verifier uses a stripped ELF probe derived
+from the vmlinux that matched the raw boot image; that probe is not a deployed
+boot artifact. Module lookup uses the actual runtime module on both architectures.
 
 The Debian build generates a temporary module-signing key and removes its
 private key after installation. Independent cold builds are therefore not
@@ -93,6 +103,8 @@ remote **caching** with local execution, not remote execution of the chroot.
 Local builds and normal CI use `sonic-bazel-registry/main` plus Bazel Central
 Registry. This Draft PR still needs the kernel execution tools in
 [registry #39](https://github.com/securely1g/sonic-bazel-registry/pull/39).
+Its ARM64 tool runtime includes the ARM32 compatibility-vDSO compiler from
+[build-infra #52](https://github.com/securely1g/sonic-build-infra/pull/52).
 Until that entry lands, source/cache CI explicitly replaces the single SONiC
 endpoint in private consumer copies with `codex/kernel-build-tools-current`.
 It does not add a fallback registry or pin a registry commit. Local review builds
@@ -101,7 +113,10 @@ temporary override when the exact dependency lands on main.
 
 ## Run locally and verify cache reuse
 
-The launcher needs Linux AMD64 and Docker. Root runs only inside its disposable
+The launcher needs native Linux AMD64 or ARM64 and Docker. It selects the matching
+checksum-pinned Bazel binary, Docker image platform and Bazel execution/target
+platforms. `--architecture amd64` or `--architecture arm64` can assert the native
+host architecture; a mismatched host is rejected. Root runs only inside its disposable
 pinned Debian container, with Docker's normal `SYS_CHROOT`/`MKNOD` capabilities;
 there is no privileged mode or mounted Docker socket. The launcher installs
 `xz-utils` only to bootstrap APT repository-index decompression. Kernel compiler,
@@ -118,6 +133,10 @@ python3 tools/bazel/build.py \
   --remote-cache http://127.0.0.1:8080
 ```
 
+The same launcher command works on either native architecture. Direct Bazel
+commands on an ARM64 host use `--config=arm64` with the root `.bazelrc`; the
+default direct-Bazel configuration remains AMD64.
+
 The own-source override validates the proposed component. Buildimage's registered
 consumer selects the published source snapshot; rerun that graph after source
 and registry updates. Keep dependency versions aligned between consumers.
@@ -128,6 +147,7 @@ no disk cache. Run:
 
 ```sh
 python3 tools/bazel/verify_cache.py \
+  --architecture amd64 \
   --cold /tmp/my-kernel-build --hit /tmp/my-kernel-cache-hit \
   --artifacts /tmp/my-kernel-evidence
 ```
@@ -135,11 +155,18 @@ python3 tools/bazel/verify_cache.py \
 The verifier requires real cold execution and a `remote cache hit` for the
 second kernel action, identical declared action inputs, and identical hashes
 for all three TARs and the manifest. Timing alone does not establish a hit.
+Use `--architecture arm64` for ARM64 verification. Invocations, manifest ABI,
+tool identity, TAR layout and debugger results must match the expected architecture.
 Without a remote service, omit that option; `--repository-cache` only reuses
 verified downloads, while an optional `--disk-cache` stores local action results.
 Never put credentials in the recorded remote-cache URL.
 
 ## CI evidence
+
+The matrix uses `ubuntu-24.04` for AMD64 and native `ubuntu-24.04-arm` for ARM64.
+Each job checks its native machine/userspace architecture, compiles into an empty
+remote cache, and verifies a fresh read-only consumer with its disk cache disabled.
+Checks and artifact names distinguish the two architectures.
 
 Source/cache CI retains three verified TARs, `kernel-artifacts.json`,
 `validation.json`, and `resolution.json`. The collector validates the complete

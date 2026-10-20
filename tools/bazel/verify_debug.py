@@ -9,7 +9,9 @@ import re
 import subprocess
 import tempfile
 
-ABI = "6.12.41+deb13-sonic-amd64"
+from kernel_arch import ARCHITECTURES, kernel_abi, materialize_kernel_elf
+
+ABI = kernel_abi()
 
 
 def gdb_check(executable, expected_debug, debug_root, source_root, *, kernel):
@@ -61,12 +63,13 @@ print("SONIC_GDB_VERIFIED " + json.dumps({"function": name, "source": str(source
     return json.loads(matches[0])
 
 
-def verify(root):
+def verify(root, architecture="amd64"):
+    abi = kernel_abi(architecture)
     root = root.resolve()
-    source = root / "usr/src/debug" / ("linux-" + ABI)
+    source = root / "usr/src/debug" / ("linux-" + abi)
     debug = root / "usr/lib/debug"
     version = subprocess.check_output(["gdb", "--version"], text=True).splitlines()[0]
-    modules = root / "usr/lib/modules" / ABI
+    modules = root / "usr/lib/modules" / abi
     candidates = sorted(modules.rglob("dummy.ko*")) or sorted(modules.rglob("veth.ko*")) or sorted(modules.rglob("*.ko.xz"))
     if not candidates:
         raise ValueError("Installed runtime contains no module for debugger validation")
@@ -74,17 +77,16 @@ def verify(root):
     with tempfile.TemporaryDirectory(prefix="kernel-gdb-") as temporary:
         temporary = Path(temporary)
         kernel = temporary / "vmlinux"
-        with kernel.open("wb") as output:
-            subprocess.run(["/bin/sh", str(source / "debian/build/source_sonic/scripts/extract-vmlinux"),
-                            str(root / ("boot/vmlinuz-" + ABI))], stdout=output, check=True)
-        kernel_result = gdb_check(kernel, debug / ("boot/vmlinux-" + ABI), root, source, kernel=True)
+        materialize_kernel_elf(architecture, source / "debian/build/source_sonic",
+                               root / ("boot/vmlinuz-" + abi), debug / ("boot/vmlinux-" + abi), kernel)
+        kernel_result = gdb_check(kernel, debug / ("boot/vmlinux-" + abi), root, source, kernel=True)
         module = temporary / "module.ko"
         module.write_bytes(lzma.decompress(selected.read_bytes()) if selected.suffix == ".xz" else selected.read_bytes())
         relative = selected.relative_to(modules)
         if relative.suffix == ".xz":
             relative = relative.with_suffix("")
-        module_result = gdb_check(module, debug / "lib/modules" / ABI / relative, root, source, kernel=False)
-    return {"schema": 1, "result": "passed", "gdb": version,
+        module_result = gdb_check(module, debug / "lib/modules" / abi / relative, root, source, kernel=False)
+    return {"schema": 1, "result": "passed", "architecture": architecture, "gdb": version,
             "kernel": kernel_result, "module": dict(module_result, path=str(relative))}
 
 
@@ -92,8 +94,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="root with extracted matching runtime/debug TARs")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--architecture", choices=ARCHITECTURES, default="amd64")
     args = parser.parse_args()
-    result = verify(args.root)
+    result = verify(args.root, args.architecture)
     encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(encoded)
