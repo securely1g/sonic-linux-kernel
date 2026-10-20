@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -39,22 +40,39 @@ def fixture(root):
             "linux_6.12.41-1.dsc", "linux_6.12.41.orig.tar.xz", "linux_6.12.41-1.debian.tar.xz",
         )
     ], key=lambda item: item["name"])
-    packages = []
-    for index, name in enumerate(sorted(kernel_action.PACKAGE_NAMES)):
-        # These bytes are deliberately not Debian packages. The test exercises
-        # copying and hashing and never invokes a package creation tool.
-        content = ("fake-package-bytes-" + str(index)).encode()
-        (verified / name).write_bytes(content)
-        package, version, architecture = name.removesuffix(".deb").rsplit("_", 2)
-        packages.append({"name": name, "sha256": digest(content), "size": len(content),
-                         "package": package, "version": version, "architecture": architecture})
+    records = []
+    abi = artifacts.CONFIGURATION["kernel_abi"]
+    members = {
+        "runtime": ["boot/vmlinuz-" + abi, "boot/config-" + abi,
+                    "usr/lib/modules/" + abi + "/kernel/example.ko.xz"],
+        "debug": ["usr/lib/debug/boot/vmlinux-" + abi,
+                  "usr/lib/debug/lib/modules/" + abi + "/kernel/example.ko",
+                  "usr/src/debug/linux-" + abi + "/debian/build/source_sonic/init/main.c",
+                  "usr/src/debug/linux-" + abi + "/debian/build/source_sonic/drivers/net/dummy.c"],
+        "development": ["usr/src/linux-headers-" + abi + "/" + name
+                        for name in (".config", "Module.symvers", "Makefile")]
+                       + ["usr/lib/linux-kbuild-6.12.41+deb13/scripts/mod/modpost"],
+    }
+    for name in sorted(kernel_action.ARTIFACT_NAMES):
+        kind = kernel_action.ARTIFACT_KINDS[name]
+        with tarfile.open(verified / name, "w") as archive:
+            for member_name in members[kind]:
+                # Source-free payload fixtures exercise TAR validation; no
+                # Debian packaging command runs in this suite.
+                content = ("fixture-" + member_name).encode()
+                member = tarfile.TarInfo(member_name)
+                member.size, member.mode = len(content), 0o644
+                archive.addfile(member, io.BytesIO(content))
+        content = (verified / name).read_bytes()
+        records.append({"name": name, "kind": kind, "sha256": digest(content), "size": len(content)})
     inputs = [digest(b"tool")]
     tools = {"schema_version": 1, "kind": "debian-build-tools", "architecture": "amd64",
              "input_sha256": inputs, "packages": {"python3": "3.13.5-1"},
              "identity_sha256": digest(json.dumps({"architecture": "amd64", "inputs": inputs}, sort_keys=True).encode())}
     manifest = {**artifacts.CONFIGURATION, "source_archives": archives, "source_files": inventory,
                 "source_tree_sha256": kernel_action.source_tree_sha256(inventory), "build_tools": tools,
-                "packages": packages, "created_packages": [dict(record, exported=True) for record in packages]}
+                "artifacts": records, "debug": {"kernel_build_id": "12" * 20, "module_count": 1,
+                    "module_build_ids_sha256": digest(b"module-build-ids")}}
     write_json(verified / artifacts.MANIFEST, manifest)
     proof = {"schema": 1, "result": "passed", "cold_compiled": True,
              "consumer_kernel_runner": "remote cache hit", "consumer_kernel_cache_hit": True,
@@ -83,6 +101,13 @@ def fixture(root):
         (private / run / "module-graph.exit-code").write_text("0\n")
         for name in ("build.log", "execution.json", "bep.json", "profile.json.gz", "invocation.json"):
             (private / run / name).write_text(SENTINEL)
+    write_json(private / "debugger.json", {
+        "schema": 1, "result": "passed", "gdb": "GNU gdb (Debian 16.3-1) 16.3",
+        "kernel": {"function": "start_kernel", "source": "debian/build/source_sonic/init/main.c",
+                   "line": 900, "type_lookup": True},
+        "module": {"function": "dummy_init", "source": "debian/build/source_sonic/drivers/net/dummy.c",
+                   "line": 200, "type_lookup": False, "path": "kernel/example.ko"},
+    })
     (private / "cache.log").write_text(SENTINEL)
     (private / "unselected-secret-file").write_text(SENTINEL)
     return private, (REVISION, inventory, archives)
@@ -109,13 +134,13 @@ class ArtifactTest(unittest.TestCase):
             private, expected = fixture(root)
             output = root / "public"
             result = self.collect(private, expected, output)
-            self.assertEqual(result, {"result": "passed", "published_file_count": 7})
+            self.assertEqual(result, {"result": "passed", "published_file_count": 6})
             self.assertEqual({path.name for path in output.iterdir()},
-                             kernel_action.PACKAGE_NAMES | {artifacts.MANIFEST, "validation.json", "resolution.json"})
+                             kernel_action.ARTIFACT_NAMES | {artifacts.MANIFEST, "validation.json", "resolution.json"})
             for path in output.iterdir():
                 self.assertNotIn(SENTINEL.encode(), path.read_bytes())
                 self.assertFalse(path.is_symlink())
-            for name in kernel_action.PACKAGE_NAMES | {artifacts.MANIFEST}:
+            for name in kernel_action.ARTIFACT_NAMES | {artifacts.MANIFEST}:
                 self.assertEqual((output / name).read_bytes(), (private / "verified" / name).read_bytes())
             validation = json.loads((output / "validation.json").read_text())
             self.assertEqual(validation["checkout_revision"], REVISION)
@@ -132,7 +157,7 @@ class ArtifactTest(unittest.TestCase):
         changes = (
             lambda manifest: manifest.update(environment=SENTINEL),
             lambda manifest: manifest["build_tools"].update(environment=SENTINEL),
-            lambda manifest: manifest["packages"][0].update(environment=SENTINEL),
+            lambda manifest: manifest["artifacts"][0].update(environment=SENTINEL),
             lambda manifest: manifest["source_files"][0].update(environment=SENTINEL),
         )
         for change in changes:
@@ -163,7 +188,7 @@ class ArtifactTest(unittest.TestCase):
             self.assertEqual(result, {"result": "incomplete", "published_file_count": 1})
             content = (root / "public/validation.json").read_text()
             self.assertNotIn(SENTINEL, content)
-            self.assertFalse(json.loads(content)["packages_published"])
+            self.assertFalse(json.loads(content)["artifacts_published"])
 
     def test_rejects_symlink_inputs_and_existing_destinations(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,14 +229,88 @@ class ArtifactTest(unittest.TestCase):
                     self.collect(private, expected, root / "public")
                 self.assertFalse((root / "public").exists())
 
-    def test_rejects_changed_package_bytes(self):
+    def test_rejects_changed_tar_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             private, expected = fixture(root)
-            (private / "verified" / sorted(kernel_action.PACKAGE_NAMES)[0]).write_bytes(b"changed")
+            (private / "verified" / sorted(kernel_action.ARTIFACT_NAMES)[0]).write_bytes(b"changed")
             with self.assertRaises(artifacts.CollectionError):
                 self.collect(private, expected, root / "public")
             self.assertFalse((root / "public").exists())
+
+    def test_rejects_wrong_tar_kind_and_invalid_debug_inventory(self):
+        changes = (
+            lambda manifest: manifest["artifacts"][0].update(kind="runtime"),
+            lambda manifest: manifest["debug"].update(module_count=0),
+            lambda manifest: manifest["debug"].update(module_count=2),
+            lambda manifest: manifest["debug"].update(kernel_build_id="not-a-build-id"),
+            lambda manifest: manifest["debug"].update(environment=SENTINEL),
+        )
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                private, expected = fixture(root)
+                self.update_manifest(private, change)
+                with self.assertRaises(artifacts.CollectionError):
+                    self.collect(private, expected, root / "public")
+                self.assertFalse((root / "public").exists())
+
+    def test_rejects_renamed_deb_unsafe_paths_and_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.tar"
+            path.write_bytes(b"!<arch>\nnot-a-tar")
+            with self.assertRaises(tarfile.TarError):
+                artifacts.validate_tar(path, "runtime")
+            for name, kind in (("../escape", tarfile.REGTYPE), ("/absolute", tarfile.REGTYPE),
+                               ("nested/package.deb", tarfile.REGTYPE), ("dev/device", tarfile.CHRTYPE)):
+                with self.subTest(name=name):
+                    with tarfile.open(path, "w") as archive:
+                        member = tarfile.TarInfo(name)
+                        member.type = kind
+                        archive.addfile(member)
+                    with self.assertRaises(artifacts.CollectionError):
+                        artifacts.validate_tar(path, "runtime")
+
+    def test_rejects_duplicate_members_and_symlink_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime.tar"
+            for traversal in (False, True):
+                with self.subTest(traversal=traversal):
+                    with tarfile.open(path, "w") as archive:
+                        first = tarfile.TarInfo("usr/include")
+                        if traversal:
+                            first.type, first.linkname = tarfile.SYMTYPE, "/tmp"
+                        archive.addfile(first)
+                        archive.addfile(tarfile.TarInfo("usr/include/file" if traversal else "./usr/include"))
+                    with self.assertRaises(artifacts.CollectionError):
+                        artifacts.validate_tar(path, "runtime")
+
+    def test_rejects_missing_or_invalid_debugger_receipt(self):
+        for mutation in ("missing", "type", "path", "source", "absent-source", "absent-module", "unknown"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                private, expected = fixture(root)
+                path = private / "debugger.json"
+                value = json.loads(path.read_text())
+                if mutation == "missing":
+                    path.unlink()
+                else:
+                    if mutation == "type":
+                        value["kernel"]["type_lookup"] = 1
+                    elif mutation == "path":
+                        value["module"]["path"] = "kernel/../../outside.ko"
+                    elif mutation == "source":
+                        value["kernel"]["source"] = "/tmp/not-shipped.c"
+                    elif mutation == "absent-source":
+                        value["kernel"]["source"] = "missing.c"
+                    elif mutation == "absent-module":
+                        value["module"]["path"] = "kernel/not-shipped.ko"
+                    else:
+                        value["module"]["private"] = SENTINEL
+                    write_json(path, value)
+                with self.assertRaises(artifacts.CollectionError):
+                    self.collect(private, expected, root / "public")
+                self.assertFalse((root / "public").exists())
 
     def test_cli_never_prints_untrusted_exception_details(self):
         output = io.StringIO()
@@ -236,7 +335,7 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(len(builds), 2)
         for run, step in zip(("cold", "hit"), builds):
             self.assertIn('--workspace "$RUNNER_TEMP/kernel-private/' + run + '-consumer"', step)
-            self.assertIn("--target @sonic_linux_kernel//:kernel_packages", step)
+            self.assertIn("--target @sonic_linux_kernel//:kernel_artifacts", step)
             self.assertIn('> "$RUNNER_TEMP/kernel-private/' + run + '-launcher.log" 2>&1', step)
 
 

@@ -5,25 +5,26 @@ import argparse
 import ast
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kernel_action
 
-MANIFEST = "kernel-packages.json"
-PACKAGE_KEYS = {"name", "sha256", "size", "package", "version", "architecture"}
+MANIFEST = "kernel-artifacts.json"
+ARTIFACT_KEYS = {"name", "kind", "sha256", "size"}
 MANIFEST_KEYS = {
     "schema", "architecture", "platform", "kernel_version", "kernel_abi",
     "package_version", "signing", "source_date_epoch", "source_archives",
-    "source_tree_sha256", "source_files", "build_tools", "created_packages", "packages",
+    "source_tree_sha256", "source_files", "build_tools", "artifacts", "debug",
 }
 CONFIGURATION = {
-    "schema": 1, "architecture": "amd64", "platform": "vs", "kernel_version": "6.12.41",
+    "schema": 2, "architecture": "amd64", "platform": "vs", "kernel_version": "6.12.41",
     "kernel_abi": "6.12.41+deb13-sonic-amd64", "package_version": "6.12.41-1",
     "signing": "unsigned", "source_date_epoch": kernel_action.SOURCE_DATE_EPOCH,
 }
@@ -41,6 +42,7 @@ PRIVATE_FILES = {
     "cold_lock": "cold-consumer/MODULE.bazel.lock",
     "hit_lock": "hit-consumer/MODULE.bazel.lock",
     "cache_log": "cache.log", "cache_proof": "verified/cache-proof.json",
+    "installed_debugger": "debugger.json",
 }
 DIGEST = re.compile(r"[0-9a-f]{64}")
 MODULE_NAME = re.compile(r"[a-z][a-z0-9._-]{0,127}")
@@ -99,14 +101,19 @@ def git(source, *arguments):
 def checkout_inputs(source):
     """Bind public manifest paths and archive records to the checked-out source."""
     source = Path(source).resolve(strict=True)
-    selected = ["Makefile", "manage-config", "config.local", "patches-debian", "patches-sonic"]
+    selected = ["Makefile", "manage-config", "config.local", "patches-debian", "patches-sonic",
+                "tools/bazel/stage_kernel.py", "tools/bazel/stage-kernel.mk"]
     revision = git(source, "rev-parse", "HEAD")
     require(re.fullmatch(r"[0-9a-f]{40}", revision), "invalid source revision")
     git(source, "diff", "--quiet", "HEAD", "--", *selected, "tools/bazel/sources.bzl")
     tracked = set(git(source, "ls-files", "--", *selected).splitlines())
-    actual = set(selected[:2])
-    for name in selected[2:]:
-        actual.update(str(path.relative_to(source)) for path in (source / name).rglob("*") if path.is_file())
+    actual = set()
+    for name in selected:
+        path = source / name
+        if path.is_dir():
+            actual.update(str(child.relative_to(source)) for child in path.rglob("*") if child.is_file())
+        else:
+            actual.add(name)
     require(actual == tracked, "source inventory differs from the checked-out revision")
     inventory = kernel_action.source_inventory([
         {"name": name, "path": str(file_at(source, name))} for name in sorted(actual)
@@ -131,20 +138,84 @@ def checkout_inputs(source):
     return revision, inventory, sorted(archives, key=lambda item: item["name"])
 
 
-def validate_package(record, *, created=False):
-    require(isinstance(record, dict) and set(record) == PACKAGE_KEYS | ({"exported"} if created else set()),
-            "unexpected package record fields")
-    require(isinstance(record["package"], str) and re.fullmatch(r"linux-[a-z0-9][a-z0-9+.-]{0,127}", record["package"])
-            and record["version"] == CONFIGURATION["package_version"]
-            and record["architecture"] in ("all", "amd64"), "invalid package metadata")
-    require(record["name"] == f'{record["package"]}_{record["version"]}_{record["architecture"]}.deb',
-            "package filename differs from metadata")
+def validate_artifact(record):
+    require(isinstance(record, dict) and set(record) == ARTIFACT_KEYS,
+            "unexpected artifact record fields")
+    require(record["name"] in kernel_action.ARTIFACT_NAMES
+            and record["kind"] == kernel_action.ARTIFACT_KINDS[record["name"]],
+            "unexpected artifact name or kind")
     require(type(record["size"]) is int and 0 < record["size"] <= 2**40
             and isinstance(record["sha256"], str) and DIGEST.fullmatch(record["sha256"]),
-            "invalid package size or digest")
-    if created:
-        require(type(record["exported"]) is bool and record["exported"] == (record["name"] in kernel_action.PACKAGE_NAMES),
-                "invalid created package export flag")
+            "invalid artifact size or digest")
+
+
+def validate_tar(path, kind, *, debugger_sources=()):
+    """Check the actual archive namespace without extracting or executing files."""
+    names, regular, links, modules = set(), set(), {}, set()
+    abi = CONFIGURATION["kernel_abi"]
+    with tarfile.open(path, mode="r:") as archive:
+        for member in archive:
+            raw = PurePosixPath(member.name)
+            require(not raw.is_absolute() and ".." not in raw.parts,
+                    "unsafe TAR member path")
+            name = str(raw)
+            if name == ".":
+                require(member.isdir(), "invalid TAR root")
+                continue
+            require(name not in names, "duplicate TAR member")
+            names.add(name)
+            require(member.isfile() or member.isdir() or member.issym(), "unsupported TAR member type")
+            require(member.uid == 0 and member.gid == 0 and not member.mode & 0o6000,
+                    "unsafe TAR ownership or permissions")
+            require(not name.endswith((".deb", ".udeb", ".ddeb")), "DEB payload in TAR output")
+            if member.issym():
+                require(member.linkname and "\x00" not in member.linkname, "invalid TAR link")
+                target = PurePosixPath(member.linkname)
+                # Absolute header links intentionally name paths in the installed
+                # filesystem. Relative links may climb only within that root.
+                parts = [] if target.is_absolute() else list(raw.parent.parts)
+                for part in target.parts:
+                    if part in ("/", "."):
+                        continue
+                    if part == "..":
+                        require(parts, "TAR link escapes installation root")
+                        parts.pop()
+                    else:
+                        parts.append(part)
+                links[name] = "/".join(parts)
+            if member.isfile():
+                regular.add(name)
+                if re.search(r"\.ko(?:\.xz|\.gz|\.zst)?$", name):
+                    modules.add(name)
+        require(not any(str(parent) in links for name in names
+                        for parent in PurePosixPath(name).parents),
+                "TAR member descends through a symlink")
+        if kind == "runtime":
+            required = {"boot/vmlinuz-" + abi, "boot/config-" + abi}
+            require(required <= regular and modules, "runtime TAR lacks kernel or modules")
+            require(all(name.startswith(("lib/modules/" + abi + "/", "usr/lib/modules/" + abi + "/"))
+                        for name in modules), "runtime TAR contains modules for another ABI")
+            require(not any(name.startswith("usr/lib/debug/") for name in regular),
+                    "debug payload in runtime TAR")
+        elif kind == "debug":
+            require("usr/lib/debug/boot/vmlinux-" + abi in regular and modules,
+                    "debug TAR lacks kernel symbols or modules")
+            require(all("usr/src/debug/linux-" + abi + "/" + name in regular for name in debugger_sources),
+                    "debugger source is absent from the debug TAR")
+            require(all(name.startswith("usr/lib/debug/") and name.endswith(".ko") for name in modules),
+                    "debug TAR contains misplaced or compressed modules")
+            require(all(name.startswith(("usr/lib/debug/", "usr/share/doc/", "usr/src/debug/linux-" + abi + "/"))
+                        for name in regular), "runtime payload in debug TAR")
+        elif kind == "development":
+            headers = "usr/src/linux-headers-" + abi + "/"
+            require({headers + ".config", headers + "Module.symvers", headers + "Makefile"} <= regular,
+                    "development TAR lacks usable configured headers")
+            require(any(name.startswith("usr/lib/linux-kbuild-") for name in regular),
+                    "development TAR lacks kbuild tools")
+            require(not modules, "runtime modules in development TAR")
+        else:
+            raise CollectionError("unexpected artifact kind")
+    return modules
 
 
 def validate_manifest(manifest, inventory, archives):
@@ -171,21 +242,50 @@ def validate_manifest(manifest, inventory, archives):
         isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9+.-]{0,127}", name)
         and isinstance(version, str) and re.fullmatch(r"[0-9][A-Za-z0-9.+:~_-]{0,127}", version)
         for name, version in packages.items()), "invalid build-tools package inventory")
-    exported = manifest["packages"]
-    require(isinstance(exported, list) and len(exported) == 4, "expected four exported packages")
-    for record in exported:
-        validate_package(record)
-    require(exported == sorted(exported, key=lambda item: item["name"])
-            and {item["name"] for item in exported} == kernel_action.PACKAGE_NAMES, "unexpected exported package set")
-    created = manifest["created_packages"]
-    require(isinstance(created, list) and 4 <= len(created) <= 64, "invalid created package inventory")
-    for record in created:
-        validate_package(record, created=True)
-    require(created == sorted(created, key=lambda item: item["name"])
-            and len({item["name"] for item in created}) == len(created), "duplicate or unordered created packages")
-    created_exports = [{key: value for key, value in record.items() if key != "exported"}
-                       for record in created if record["exported"]]
-    require(created_exports == exported, "created and exported package inventories differ")
+    records = manifest["artifacts"]
+    require(isinstance(records, list) and len(records) == 3, "expected three exported TARs")
+    for record in records:
+        validate_artifact(record)
+    require(records == sorted(records, key=lambda item: item["name"])
+            and {item["name"] for item in records} == kernel_action.ARTIFACT_NAMES,
+            "unexpected exported artifact set")
+    debug = manifest["debug"]
+    require(isinstance(debug, dict) and set(debug) == {
+        "kernel_build_id", "module_count", "module_build_ids_sha256",
+    }, "unexpected debug verification fields")
+    require(isinstance(debug["kernel_build_id"], str)
+            and re.fullmatch(r"[0-9a-f]{8,128}", debug["kernel_build_id"])
+            and type(debug["module_count"]) is int and debug["module_count"] > 0
+            and isinstance(debug["module_build_ids_sha256"], str)
+            and DIGEST.fullmatch(debug["module_build_ids_sha256"]), "invalid debug verification")
+
+
+def public_debugger(private):
+    result = read_json(file_at(private, "debugger.json"), 16 * 1024)
+    require(isinstance(result, dict) and set(result) == {"schema", "result", "gdb", "kernel", "module"}
+            and type(result["schema"]) is int and result["schema"] == 1 and result["result"] == "passed",
+            "installed debugger verification did not pass")
+    require(isinstance(result["gdb"], str) and re.fullmatch(
+        r"GNU gdb(?: \([A-Za-z0-9 .+~:-]{1,128}\))? [0-9][A-Za-z0-9.+~:-]{0,63}", result["gdb"]),
+        "invalid debugger version")
+    for kind in ("kernel", "module"):
+        record = result[kind]
+        expected = {"function", "source", "line", "type_lookup"} | ({"path"} if kind == "module" else set())
+        require(isinstance(record, dict) and set(record) == expected, "unexpected debugger record fields")
+        require(isinstance(record["function"], str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,127}", record["function"])
+                and (kind != "kernel" or record["function"] == "start_kernel")
+                and type(record["line"]) is int and 0 < record["line"] <= 10000000
+                and record["type_lookup"] is (kind == "kernel"), "invalid debugger symbol result")
+        for key in (("source", "path") if kind == "module" else ("source",)):
+            path = record[key]
+            require(isinstance(path, str) and re.fullmatch(r"[A-Za-z0-9_+./-]{1,512}", path)
+                    and not PurePosixPath(path).is_absolute() and ".." not in PurePosixPath(path).parts,
+                    "unsafe debugger result path")
+        if kind == "module":
+            require(record["path"].startswith("kernel/") and record["path"].endswith(".ko"),
+                    "invalid debugger module path")
+    return result
 
 
 def safe_metrics(value):
@@ -211,7 +311,7 @@ def public_proof(private):
             and proof.get("consumer_kernel_cache_hit") is True and proof.get("kernel_compilation_skipped") is True,
             "cache verification did not pass")
     hashes = proof.get("outputs_sha256")
-    names = kernel_action.PACKAGE_NAMES | {MANIFEST}
+    names = kernel_action.ARTIFACT_NAMES | {MANIFEST}
     require(isinstance(hashes, dict) and set(hashes) == names and all(
         isinstance(value, str) and DIGEST.fullmatch(value) for value in hashes.values()), "invalid cache output digests")
     return {
@@ -325,8 +425,8 @@ def collect(private, source, output, job_status):
     temporary = Path(tempfile.mkdtemp(prefix=".kernel-artifacts-", dir=output.parent))
     try:
         validation = {
-            "schema": 1, "artifact_policy": "allowlisted-kernel-ci-v1", "job_status": job_status,
-            "result": "incomplete", "packages_published": False, "private_evidence_present": presence,
+            "schema": 1, "artifact_policy": "allowlisted-kernel-ci-v2", "job_status": job_status,
+            "result": "incomplete", "artifacts_published": False, "private_evidence_present": presence,
         }
         if job_status == "success":
             revision, inventory, archives = checkout_inputs(source)
@@ -334,17 +434,29 @@ def collect(private, source, output, job_status):
             manifest = read_json(manifest_path, 4 * 1024 * 1024)
             validate_manifest(manifest, inventory, archives)
             proof = public_proof(private)
-            for name in sorted(kernel_action.PACKAGE_NAMES | {MANIFEST}):
+            debugger = public_debugger(private)
+            module_sets = {}
+            for name in sorted(kernel_action.ARTIFACT_NAMES | {MANIFEST}):
                 path = file_at(private, "verified/" + name)
                 require(kernel_action.sha256(path) == proof["outputs_sha256"][name], "verified output digest differs")
                 if name != MANIFEST:
-                    record = next(item for item in manifest["packages"] if item["name"] == name)
+                    record = next(item for item in manifest["artifacts"] if item["name"] == name)
                     require(path.stat().st_size == record["size"] and proof["outputs_sha256"][name] == record["sha256"],
-                            "verified package differs from manifest")
+                            "verified artifact differs from manifest")
+                    module_sets[record["kind"]] = validate_tar(
+                        path, record["kind"], debugger_sources=[debugger[key]["source"] for key in ("kernel", "module")])
                 destination = temporary / name
                 shutil.copyfile(path, destination)
                 destination.chmod(0o600)
                 require(kernel_action.sha256(destination) == proof["outputs_sha256"][name], "copied output digest differs")
+            runtime_modules = {re.sub(r"\.(xz|gz|zst)$", "", name.removeprefix("usr/")).removeprefix("lib/modules/")
+                               for name in module_sets["runtime"]}
+            debug_modules = {name.removeprefix("usr/lib/debug/lib/modules/")
+                             for name in module_sets["debug"]}
+            require(runtime_modules == debug_modules and len(runtime_modules) == manifest["debug"]["module_count"],
+                    "runtime and debug module inventories differ")
+            expected_debug_module = CONFIGURATION["kernel_abi"] + "/" + debugger["module"]["path"]
+            require(expected_debug_module in debug_modules, "debugger module is absent from debug TAR")
             cold, cold_summary = redacted_resolution(private, "cold")
             hit, hit_summary = redacted_resolution(private, "hit")
             require(cold == hit, "selected source and consumer module resolution differs")
@@ -356,9 +468,9 @@ def collect(private, source, output, job_status):
             }
             write_json(temporary, "resolution.json", resolution)
             validation.update({
-                "result": "passed", "packages_published": True, "checkout_revision": revision,
-                "configuration": {**CONFIGURATION, "distribution": "trixie", "target": "@sonic_linux_kernel//:kernel_packages"},
-                "cache_proof": proof, "selected_module_count": len(cold["modules"]),
+                "result": "passed", "artifacts_published": True, "checkout_revision": revision,
+                "configuration": {**CONFIGURATION, "distribution": "trixie", "target": "@sonic_linux_kernel//:kernel_artifacts"},
+                "cache_proof": proof, "debugger": debugger, "selected_module_count": len(cold["modules"]),
             })
         write_json(temporary, "validation.json", validation)
         require(not output.exists() and not output.is_symlink(), "artifact destination appeared during collection")

@@ -3,7 +3,11 @@ load("@sonic_build_infra//tools/build_tools:defs.bzl", "python_runtime")
 
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["kernel_action.py"])
+exports_files([
+    "kernel_action.py",
+    "stage_kernel.py",
+    "stage-kernel.mk",
+])
 
 python_runtime(name = "python_runtime")
 
@@ -43,4 +47,13 @@ py_test(
     ],
     data = ["//:.github/workflows/bazel.yml"],
     main = "collect_ci_artifacts_test.py",
+)
+
+py_test(
+    name = "stage_kernel_test",
+    srcs = [
+        "stage_kernel.py",
+        "stage_kernel_test.py",
+    ],
+    main = "stage_kernel_test.py",
 )

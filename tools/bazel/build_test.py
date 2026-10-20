@@ -26,7 +26,7 @@ class KernelLauncherTest(unittest.TestCase):
                 java_trust_store=None, ca_bundle=None, distdir=None,
                 module_override=[("sonic-linux-kernel", source)],
                 bazel_arg=["--strategy=SonicKernelBuild=local"],
-                target="@sonic_linux_kernel//:kernel_packages", worker_image=build.WORKER_IMAGE,
+                target="@sonic_linux_kernel//:kernel_artifacts", worker_image=build.WORKER_IMAGE,
             )
             command = build.worker_command(args, root / "bazel", "kernel-test")
             self.assertIn("--cpus=4", command)

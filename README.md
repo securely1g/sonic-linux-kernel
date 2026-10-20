@@ -27,7 +27,7 @@ Usage:
 If DEST is not set, package will stay in current directory.
 
 The optional [Bazel source build](tools/bazel/README.md) produces the AMD64 VS
-kernel packages and supports sharing the compiled packages through a Bazel
+kernel runtime, debug and development TARs and supports sharing them through a Bazel
 remote action cache.
 
 ## Kernel Configuration Changes

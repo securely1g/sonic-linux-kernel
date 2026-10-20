@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the original kernel packages offline in a verified shared worker."""
+"""Compile and stage kernel TARs offline in a verified shared worker."""
 
 import hashlib
 import json
@@ -13,12 +13,14 @@ import stat
 import tempfile
 
 SOURCE_DATE_EPOCH = 1754969284  # Debian linux 6.12.41-1 changelog timestamp.
-PACKAGE_NAMES = {
-    "linux-headers-6.12.41+deb13-common-sonic_6.12.41-1_all.deb",
-    "linux-headers-6.12.41+deb13-sonic-amd64_6.12.41-1_amd64.deb",
-    "linux-image-6.12.41+deb13-sonic-amd64-unsigned_6.12.41-1_amd64.deb",
-    "linux-kbuild-6.12.41+deb13_6.12.41-1_amd64.deb",
+ARTIFACT_KINDS = {
+    "kernel-runtime.tar": "runtime",
+    "kernel-debug.tar": "debug",
+    "kernel-development.tar": "development",
 }
+ARTIFACT_NAMES = set(ARTIFACT_KINDS)
+EXTRA_SOURCES = ("tools/bazel/stage_kernel.py", "tools/bazel/stage-kernel.mk")
+
 
 
 def require(condition, message):
@@ -89,7 +91,7 @@ def source_tree_sha256(inventory):
 
 
 def checkout_source_identity(checkout):
-    files = [checkout / name for name in ("Makefile", "manage-config")]
+    files = [checkout / name for name in ("Makefile", "manage-config", *EXTRA_SOURCES)]
     for directory in ("config.local", "patches-debian", "patches-sonic"):
         files.extend(path for path in (checkout / directory).rglob("*") if path.is_file())
     return source_tree_sha256(source_inventory([
@@ -97,54 +99,39 @@ def checkout_source_identity(checkout):
     ]))
 
 
-def package_record(path, root, *, exported=True):
-    require(path.is_file() and not path.is_symlink(), "kernel package must be a regular file: " + str(path))
-    relative = path.resolve().relative_to(root.resolve())
-    metadata = in_chroot(
-        root, ["/usr/bin/dpkg-deb", "-f", "/" + str(relative),
-               "Package", "Version", "Architecture"], check=True, capture_output=True, text=True,
-    ).stdout
-    values = dict(line.split(": ", 1) for line in metadata.splitlines())
-    expected_arch = "all" if "common-sonic" in path.name else "amd64"
-    require(values["Version"] == "6.12.41-1" and values["Architecture"] in ("all", "amd64")
-            and (not exported or values["Architecture"] == expected_arch),
-            "kernel package version or architecture differs from target: " + path.name)
-    require(path.name == f'{values["Package"]}_{values["Version"]}_{values["Architecture"]}.deb',
-            "kernel package filename differs from its control metadata")
-    return {"name": path.name, "sha256": sha256(path), "size": path.stat().st_size,
-            "package": values["Package"], "version": values["Version"],
-            "architecture": values["Architecture"]}
-
-
-def created_package_records(root, source, destination):
-    """Record every DEB left by dpkg-buildpackage before private scratch cleanup."""
-    records = {}
-    # The existing Make recipe builds DEBs in its source directory and moves
-    # the four exported files to DEST. Both directories start empty here.
-    for directory in (source, destination):
-        for path in sorted(directory.glob("*.deb")):
-            record = package_record(path, root, exported=path.name in PACKAGE_NAMES)
-            record["exported"] = path.name in PACKAGE_NAMES
-            if path.name in records:
-                require(records[path.name] == record, "duplicate kernel package bytes differ: " + path.name)
-            records[path.name] = record
-    require(PACKAGE_NAMES <= records.keys(), "kernel build omitted required packages from its created inventory")
-    return [records[name] for name in sorted(records)]
-
-
 def validate_outputs(config):
     outputs = config.get("outputs")
-    require(isinstance(outputs, list) and len(outputs) == len(PACKAGE_NAMES)
+    require(isinstance(outputs, list) and len(outputs) == len(ARTIFACT_NAMES)
             and all(isinstance(name, str) and name for name in outputs)
-            and {Path(name).name for name in outputs} == PACKAGE_NAMES,
-            "kernel action must declare exactly the four supported packages")
+            and {Path(name).name for name in outputs} == ARTIFACT_NAMES,
+            "kernel action must declare exactly runtime, debug and development TARs")
     require(isinstance(config.get("manifest"), str)
-            and Path(config["manifest"]).name == "kernel-packages.json",
-            "kernel action must declare kernel-packages.json")
+            and Path(config["manifest"]).name == "kernel-artifacts.json",
+            "kernel action must declare kernel-artifacts.json")
+
+
+def compilation_commands():
+    """Only source/configuration/build/install targets; never binary packages."""
+    kernel = "/build/source/linux-6.12.41"
+    return [
+        ["/usr/bin/dpkg-source", "-x", "/build/archives/linux_6.12.41-1.dsc", kernel],
+        ["/bin/cp", "-a", "/build/source/config.local", "/build/source/patches-sonic", kernel + "/debian/"],
+        ["/usr/bin/patch", "-d", kernel, "-p1", "-i", "/build/source/patches-debian/disable-secureboot-config-checks.patch"],
+        ["/bin/bash", "-ec", "cd " + kernel +
+         " && if test -f debian/config.local/amd64/config.sonic-vs; then "
+         "cp debian/config.local/amd64/config.sonic-vs debian/config.local/amd64/config.sonic-platform-specific; fi"
+         " && /build/source/manage-config amd64 no_sign '' && debian/bin/gencontrol.py"],
+        ["/usr/bin/make", "-C", kernel, "-f", "debian/rules.gen", "-j4",
+         "build-arch_amd64_sonic_amd64_image", "build-arch_amd64_kbuild"],
+        ["/usr/bin/make", "-C", kernel, "-f", "/build/source/tools/bazel/stage-kernel.mk",
+         "sonic-install-kbuild", "ABINAME=6.12.41+deb13", "ARCH=amd64", "KERNEL_ARCH=x86",
+         "VERSION=6.12", "SOURCEVERSION=6.12.41-1", "DESTDIR=/build/stage/development"],
+        ["/usr/bin/python3", "/build/source/tools/bazel/stage_kernel.py", kernel, "/build/stage", "/build/artifacts"],
+    ]
 
 
 def build(config):
-    require(config.get("schema") == 1, "unsupported kernel action schema")
+    require(config.get("schema") == 2, "unsupported kernel action schema")
     validate_outputs(config)
     require(os.geteuid() == 0, "kernel action requires root in its disposable worker for chroot")
     runtime = Path(config["build_tools"])
@@ -159,7 +146,7 @@ def build(config):
         source.mkdir(parents=True)
         archives = root / "build/archives"
         archives.mkdir()
-        dest = root / "build/packages"
+        dest = root / "build/artifacts"
         dest.mkdir()
         (root / "build/home").mkdir()
         (root / "build/tmp").mkdir()
@@ -181,34 +168,26 @@ def build(config):
             "KBUILD_BUILD_USER": "sonic", "KBUILD_BUILD_HOST": "kernel-builder",
             "KBUILD_BUILD_TIMESTAMP": "@" + str(SOURCE_DATE_EPOCH),
             "KBUILD_BUILD_VERSION": "1", "DEB_BUILD_OPTIONS": "parallel=4",
+            "DEB_BUILD_PROFILES": "nodoc",
             "INCLUDE_EXTERNAL_PATCHES": "n",
         }
         print("SONIC_KERNEL_COMPILATION_STARTED", flush=True)
-        in_chroot(root, [
-            "/usr/bin/make", "-f", "Makefile", "DEST=/build/packages",
-            "KERNEL_SOURCE_DIR=/build/archives", "NON_UP_DIR=/build/non-upstream",
-            "CONFIGURED_ARCH=amd64", "CONFIGURED_PLATFORM=vs", "CROSS_BUILD_ENVIRON=n",
-            "KERNEL_VERSION=6.12.41", "KERNEL_ABISUFFIX=+deb13", "KERNEL_SUBVERSION=1",
-            "KERNEL_FEATURESET=sonic", "KVERSION=6.12.41+deb13-sonic-amd64",
-            "SECURE_UPGRADE_MODE=no_sign", "SECURE_UPGRADE_KERNEL_CAFILE=",
-            "SONIC_CONFIG_MAKE_JOBS=4", "ADDITIONAL_BUILD_PROFILES=",
-        ], env=environment, check=True)
-        print("SONIC_KERNEL_PACKAGE_INVENTORY_STARTED", flush=True)
-        created_packages = created_package_records(root, source, dest)
-        print("SONIC_KERNEL_CREATED_PACKAGES " + json.dumps(created_packages, sort_keys=True), flush=True)
-        created_by_name = {record["name"]: record for record in created_packages}
-        packages = []
+        for command in compilation_commands():
+            in_chroot(root, command, env=environment, check=True)
+        # A source build may read declared Debian inputs, but must create no DEBs.
+        require(not any(path.suffix in (".deb", ".udeb", ".ddeb") for path in source.rglob("*")),
+                "kernel TAR build unexpectedly created a Debian binary package")
+        artifacts = []
         for name in config["outputs"]:
             output = Path(name)
-            package = dest / output.name
-            require(package.is_file(), "kernel build omitted required package: " + package.name)
-            record = dict(created_by_name[output.name])
-            record.pop("exported")
-            packages.append(record)
+            artifact = dest / output.name
+            require(artifact.is_file(), "kernel build omitted required TAR: " + artifact.name)
+            artifacts.append({"name": artifact.name, "kind": ARTIFACT_KINDS[artifact.name],
+                              "sha256": sha256(artifact), "size": artifact.stat().st_size})
             output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(package, output)
+            shutil.copyfile(artifact, output)
         manifest = {
-            "schema": 1, "architecture": "amd64", "platform": "vs",
+            "schema": 2, "architecture": "amd64", "platform": "vs",
             "kernel_version": "6.12.41", "kernel_abi": "6.12.41+deb13-sonic-amd64",
             "package_version": "6.12.41-1", "signing": "unsigned",
             "source_date_epoch": SOURCE_DATE_EPOCH,
@@ -216,8 +195,8 @@ def build(config):
             "source_tree_sha256": source_tree_sha256(inventory),
             "source_files": inventory,
             "build_tools": marker,
-            "created_packages": created_packages,
-            "packages": sorted(packages, key=lambda entry: entry["name"]),
+            "artifacts": sorted(artifacts, key=lambda entry: entry["name"]),
+            "debug": json.loads((dest / "debug-validation.json").read_text()),
         }
         Path(config["manifest"]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         print("SONIC_KERNEL_COMPILATION_COMPLETED", flush=True)

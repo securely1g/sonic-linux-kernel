@@ -1,19 +1,14 @@
-"""Cacheable Debian kernel compilation in the pinned shared build worker."""
+"""Cacheable source kernel compilation in the pinned shared build worker."""
 
 load("@sonic_build_infra//tools/build_tools:defs.bzl", "PythonRuntimeInfo")
 load(":sources.bzl", "KERNEL_SOURCES")
 
-_PACKAGES = [
-    "linux-headers-6.12.41+deb13-common-sonic_6.12.41-1_all.deb",
-    "linux-headers-6.12.41+deb13-sonic-amd64_6.12.41-1_amd64.deb",
-    "linux-image-6.12.41+deb13-sonic-amd64-unsigned_6.12.41-1_amd64.deb",
-    "linux-kbuild-6.12.41+deb13_6.12.41-1_amd64.deb",
-]
+_ARTIFACTS = ["kernel-runtime.tar", "kernel-debug.tar", "kernel-development.tar"]
 
-def _kernel_packages_impl(ctx):
+def _kernel_artifacts_impl(ctx):
     python = ctx.attr._python[PythonRuntimeInfo]
-    outputs = [ctx.actions.declare_file(name) for name in _PACKAGES]
-    manifest = ctx.actions.declare_file("kernel-packages.json")
+    outputs = [ctx.actions.declare_file(name) for name in _ARTIFACTS]
+    manifest = ctx.actions.declare_file("kernel-artifacts.json")
     config = ctx.actions.declare_file(ctx.label.name + ".action.json")
     source_root = ctx.file.makefile.dirname + "/" if ctx.file.makefile.dirname else ""
     sources = []
@@ -26,7 +21,7 @@ def _kernel_packages_impl(ctx):
         source = KERNEL_SOURCES[name]
         archives.append({"path": src.path, "name": source.name, "sha256": source.sha256})
     ctx.actions.write(config, json.encode({
-        "schema": 1,
+        "schema": 2,
         "sources": sources,
         "archives": archives,
         "build_tools": ctx.file.build_tools.path,
@@ -47,13 +42,21 @@ def _kernel_packages_impl(ctx):
             "PYTHONHASHSEED": "0",
         },
         mnemonic = "SonicKernelBuild",
-        progress_message = "Compiling SONiC 6.12.41 AMD64 VS kernel packages",
+        progress_message = "Compiling SONiC 6.12.41 AMD64 VS kernel runtime/debug/development TARs",
         execution_requirements = {"block-network": "", "no-remote-exec": "1"},
     )
-    return [DefaultInfo(files = depset(outputs + [manifest]))]
+    return [
+        DefaultInfo(files = depset(outputs + [manifest])),
+        OutputGroupInfo(
+            runtime = depset([outputs[0]]),
+            debug = depset([outputs[1]]),
+            development = depset([outputs[2]]),
+            manifest = depset([manifest]),
+        ),
+    ]
 
-kernel_packages = rule(
-    implementation = _kernel_packages_impl,
+kernel_artifacts = rule(
+    implementation = _kernel_artifacts_impl,
     attrs = {
         "srcs": attr.label_list(allow_files = True, mandatory = True),
         "makefile": attr.label(allow_single_file = True, mandatory = True),

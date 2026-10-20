@@ -6,6 +6,8 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import shutil
+import re
+import tarfile
 
 
 def require(condition, message):
@@ -46,22 +48,55 @@ def kernel_record(directory):
     return entry
 
 
+ARTIFACT_KINDS = {
+    "kernel-runtime.tar": "runtime", "kernel-debug.tar": "debug",
+    "kernel-development.tar": "development",
+}
+MANIFEST = "kernel-artifacts.json"
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, "duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def outputs(directory):
     found = {}
     for line in (directory / "output-paths.txt").read_text().splitlines():
         relative = PurePosixPath(line).relative_to("/work")
         require(".." not in relative.parts, "output escaped the build directory")
-        path = (directory / str(relative)).resolve()
-        path.relative_to(directory.resolve())
+        path = directory
+        for part in relative.parts:
+            path = path / part
+            require(not path.is_symlink(), "kernel output must not be a symlink")
         require(path.is_file() and path.name not in found, "missing or duplicate kernel output")
+        path.resolve().relative_to(directory.resolve())
         found[path.name] = path
-    require(len(found) == 5 and "kernel-packages.json" in found, "expected four DEBs and their manifest")
-    manifest = json.loads(found["kernel-packages.json"].read_text())
-    require(len(manifest["packages"]) == 4, "manifest must describe four packages")
-    for package in manifest["packages"]:
-        path = found[package["name"]]
-        require(sha256(path) == package["sha256"] and path.stat().st_size == package["size"],
-                "kernel package bytes differ from manifest")
+    require(set(found) == set(ARTIFACT_KINDS) | {MANIFEST}, "expected three TARs and their manifest")
+    manifest = json.loads(found[MANIFEST].read_text(), object_pairs_hook=unique_object)
+    require(type(manifest.get("schema")) is int and manifest["schema"] == 2,
+            "expected TAR manifest schema 2")
+    records = manifest.get("artifacts")
+    require(isinstance(records, list) and len(records) == 3, "manifest must describe three TARs")
+    names = []
+    for artifact in records:
+        require(isinstance(artifact, dict) and set(artifact) == {"name", "kind", "sha256", "size"},
+                "unexpected artifact record fields")
+        name = artifact["name"]
+        require(name in ARTIFACT_KINDS and artifact["kind"] == ARTIFACT_KINDS[name],
+                "unexpected artifact name or kind")
+        names.append(name)
+        path = found[name]
+        require(type(artifact["size"]) is int and artifact["size"] > 0
+                and isinstance(artifact["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]),
+                "invalid artifact size or digest")
+        require(sha256(path) == artifact["sha256"] and path.stat().st_size == artifact["size"],
+                "kernel TAR bytes differ from manifest")
+        require(tarfile.is_tarfile(path), "kernel output is not a TAR archive")
+    require(names == sorted(ARTIFACT_KINDS), "duplicate or unordered artifact inventory")
     return found
 
 
@@ -79,8 +114,9 @@ def verify(cold, hit, destination):
     first_outputs, second_outputs = outputs(cold), outputs(hit)
     hashes = {name: sha256(path) for name, path in first_outputs.items()}
     require(hashes == {name: sha256(path) for name, path in second_outputs.items()},
-            "cached packages differ from freshly compiled packages")
-    destination.mkdir(parents=True, exist_ok=True)
+            "cached TARs differ from freshly compiled TARs")
+    require(not destination.exists() and not destination.is_symlink(), "artifact destination already exists")
+    destination.mkdir(parents=True)
     for name, path in second_outputs.items():
         shutil.copyfile(path, destination / name)
     receipt = {"schema": 1, "result": "passed", "cold_compiled": True,

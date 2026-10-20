@@ -22,10 +22,11 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 tools/bazel/kernel_action_test.py
+      - run: python3 tools/bazel/stage_kernel_test.py
       - run: python3 tools/bazel/build_test.py
       - run: python3 tools/bazel/verify_cache_test.py
       - run: python3 tools/bazel/collect_ci_artifacts_test.py
-      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_action.py tools/bazel/verify_cache.py tools/bazel/collect_ci_artifacts.py
+      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_action.py tools/bazel/stage_kernel.py tools/bazel/verify_debug.py tools/bazel/verify_cache.py tools/bazel/collect_ci_artifacts.py
 
   source-and-cache:
     name: AMD64 VS kernel source and remote cache
@@ -81,7 +82,7 @@ jobs:
           if docker run -d --name sonic-kernel-cache \
             --publish 127.0.0.1:8080:8080 \
             buchgr/bazel-remote-cache@sha256:d9b104d02bea731f5a8ce6d3c518f814953ef54c2e0218744ce7643ff9d85ca8 \
-            --dir=/data --max_size=4 --http_address=:8080 --grpc_address=none \
+            --dir=/data --max_size=8 --http_address=:8080 --grpc_address=none \
             > "$RUNNER_TEMP/kernel-private/cache-start.log" 2>&1; then
             echo "Started the empty loopback action cache."
           else
@@ -107,7 +108,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/kernel-private/cold" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
-            --target @sonic_linux_kernel//:kernel_packages \
+            --target @sonic_linux_kernel//:kernel_artifacts \
             --remote-cache http://127.0.0.1:8080 \
             --bazel-arg=--strategy=SonicKernelBuild=local \
             > "$RUNNER_TEMP/kernel-private/cold-launcher.log" 2>&1; then
@@ -136,7 +137,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/kernel-private/hit" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
-            --target @sonic_linux_kernel//:kernel_packages \
+            --target @sonic_linux_kernel//:kernel_artifacts \
             --remote-cache http://127.0.0.1:8080 --remote-cache-read-only \
             --bazel-arg=--strategy=SonicKernelBuild=local \
             > "$RUNNER_TEMP/kernel-private/hit-launcher.log" 2>&1; then
@@ -146,7 +147,7 @@ jobs:
             echo "Kernel cache consumer command failed with exit code $status."
             exit "$status"
           fi
-      - name: Verify compilation was skipped and packages are identical
+      - name: Verify compilation was skipped and TARs are identical
         run: |
           umask 077
           if python3 tools/bazel/verify_cache.py \
@@ -159,10 +160,26 @@ jobs:
             echo "Kernel source and cache verification failed with exit code $status."
             exit "$status"
           fi
+      - name: Verify debugger lookup from the installed TARs
+        run: |
+          umask 077
+          docker run --rm --platform=linux/amd64 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/kernel-private,dst=/evidence" \
+            debian:trixie-20260918@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c \
+            /bin/sh -ec '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gdb python3 binutils xz-utils
+              mkdir /installed
+              tar -xf /evidence/verified/kernel-runtime.tar -C /installed
+              tar -xf /evidence/verified/kernel-debug.tar -C /installed
+              python3 /source/tools/bazel/verify_debug.py --root /installed --output /evidence/debugger.json
+            ' > "$RUNNER_TEMP/kernel-private/debugger.log" 2>&1
+          echo "Installed kernel/module debug and source lookup passed."
       - name: Collect private cache service diagnostics
         if: always()
         run: docker logs sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache.log" 2>&1 || true
-      - name: Create public-safe packages and evidence
+      - name: Create public-safe TARs and evidence
         id: collect
         if: always()
         env:
@@ -171,7 +188,7 @@ jobs:
           python3 tools/bazel/collect_ci_artifacts.py \
             --private-root "$RUNNER_TEMP/kernel-private" --source-root "$GITHUB_WORKSPACE" \
             --output "$RUNNER_TEMP/kernel-artifacts" --job-status "$KERNEL_JOB_STATUS"
-      - name: Retain packages and allowlisted cache evidence
+      - name: Retain TARs and allowlisted cache evidence
         if: always() && steps.collect.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

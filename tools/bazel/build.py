@@ -78,7 +78,7 @@ def worker_command(args, executable, name):
     ]
     query = bazel + ["cquery"] + common + ["--output=files", args.target]
     # Retain the resolved graph separately from the build result. Consumers
-    # inspect its completeness and pins before accepting the package bundle.
+    # inspect its completeness and pins before accepting the artifact bundle.
     graph_options = [option for option in common if option.startswith((
         "--repository_cache=", "--repo_env=", "--distdir=", "--override_module=", "--registry=",
     ))]
@@ -146,7 +146,7 @@ def main():
     parser.add_argument("--disk-cache", type=Path)
     parser.add_argument("--remote-cache")
     parser.add_argument("--remote-cache-read-only", action="store_true")
-    parser.add_argument("--target", default="@sonic_linux_kernel//:kernel_packages")
+    parser.add_argument("--target", default="@sonic_linux_kernel//:kernel_artifacts")
     parser.add_argument("--worker-image", default=WORKER_IMAGE)
     parser.add_argument("--bazel-arg", action="append", default=[])
     parser.add_argument("--module-override", action="append", default=[], metavar="NAME=PATH")
