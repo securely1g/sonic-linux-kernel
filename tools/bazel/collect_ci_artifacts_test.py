@@ -53,6 +53,8 @@ def fixture(root, architecture="amd64"):
                         for name in (".config", "Module.symvers", "Makefile")]
                        + ["usr/lib/linux-kbuild-6.12.41+deb13/scripts/mod/modpost"],
     }
+    if architecture == "arm64":
+        members["runtime"].append("usr/lib/linux-image-" + abi + "/marvell/armada-8040-db.dtb")
     for name in sorted(kernel_action.ARTIFACT_NAMES):
         kind = kernel_action.ARTIFACT_KINDS[name]
         with tarfile.open(verified / name, "w") as archive:
@@ -114,6 +116,30 @@ def fixture(root, architecture="amd64"):
 
 
 class ArtifactTest(unittest.TestCase):
+    def test_checkout_inventory_matches_the_kernel_actions_declared_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            names = ["Makefile", "manage-config", "config.local/arm64/config",
+                     "patches-debian/fix.patch", "patches-sonic/fix.patch", *kernel_action.EXTRA_SOURCES]
+            for name in names:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("source fixture: " + name)
+            declarations = {
+                "dsc": "linux_6.12.41-1.dsc",
+                "orig": "linux_6.12.41.orig.tar.xz",
+                "debian": "linux_6.12.41-1.debian.tar.xz",
+            }
+            (source / "tools/bazel/sources.bzl").write_text("KERNEL_SOURCES = {\n" + "".join(
+                repr(key) + ": struct(name=" + repr(name) + ", sha256=" + repr(digest(name.encode())) + "),\n"
+                for key, name in declarations.items()) + "}\n")
+            with patch.object(artifacts, "git", side_effect=[REVISION, "", "\n".join(names)]):
+                revision, inventory, _archives = artifacts.checkout_inputs(source)
+            self.assertEqual(revision, REVISION)
+            self.assertEqual({item["name"] for item in inventory}, set(names))
+            self.assertEqual(kernel_action.source_tree_sha256(inventory),
+                             kernel_action.checkout_source_identity(source))
+
     def collect(self, private, expected, output, status="success", architecture="amd64"):
         with patch.object(artifacts, "checkout_inputs", return_value=expected):
             return artifacts.collect(private, private.parent / "source", output, status, architecture)
@@ -193,6 +219,23 @@ class ArtifactTest(unittest.TestCase):
             private, _expected = fixture(root, "amd64")
             with self.assertRaisesRegex(artifacts.CollectionError, "runtime TAR lacks kernel"):
                 artifacts.validate_tar(private / "verified/kernel-runtime.tar", "runtime", "arm64")
+
+    def test_arm64_runtime_requires_device_trees_for_its_abi(self):
+        for wrong_abi in (None, kernel_action.kernel_abi("amd64")):
+            with self.subTest(wrong_abi=wrong_abi), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "runtime.tar"
+                abi = kernel_action.kernel_abi("arm64")
+                names = ["boot/vmlinuz-" + abi, "boot/config-" + abi,
+                         "usr/lib/modules/" + abi + "/kernel/example.ko.xz"]
+                if wrong_abi:
+                    names.append("usr/lib/linux-image-" + wrong_abi + "/vendor/board.dtb")
+                with tarfile.open(path, "w") as archive:
+                    for name in names:
+                        member = tarfile.TarInfo(name)
+                        member.size, member.mode = 1, 0o644
+                        archive.addfile(member, io.BytesIO(b"x"))
+                with self.assertRaisesRegex(artifacts.CollectionError, "device trees"):
+                    artifacts.validate_tar(path, "runtime", "arm64")
 
     def test_rejects_unknown_manifest_fields_even_with_matching_hashes(self):
         changes = (

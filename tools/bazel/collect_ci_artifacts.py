@@ -107,7 +107,7 @@ def checkout_inputs(source):
     """Bind public manifest paths and archive records to the checked-out source."""
     source = Path(source).resolve(strict=True)
     selected = ["Makefile", "manage-config", "config.local", "patches-debian", "patches-sonic",
-                "tools/bazel/stage_kernel.py", "tools/bazel/stage-kernel.mk"]
+                *kernel_action.EXTRA_SOURCES]
     revision = git(source, "rev-parse", "HEAD")
     require(re.fullmatch(r"[0-9a-f]{40}", revision), "invalid source revision")
     git(source, "diff", "--quiet", "HEAD", "--", *selected, "tools/bazel/sources.bzl")
@@ -202,6 +202,12 @@ def validate_tar(path, kind, architecture="amd64", *, debugger_sources=()):
                         for name in modules), "runtime TAR contains modules for another ABI")
             require(not any(name.startswith("usr/lib/debug/") for name in regular),
                     "debug payload in runtime TAR")
+            device_trees = {name for name in regular if name.endswith((".dtb", ".dtbo"))}
+            require(all(name.startswith("usr/lib/linux-image-" + abi + "/") for name in device_trees),
+                    "runtime TAR contains device trees for another ABI")
+            if architecture == "arm64":
+                require(any(name.endswith(".dtb") for name in device_trees),
+                        "ARM64 runtime TAR lacks device trees")
         elif kind == "debug":
             require("usr/lib/debug/boot/vmlinux-" + abi in regular and modules,
                     "debug TAR lacks kernel symbols or modules")

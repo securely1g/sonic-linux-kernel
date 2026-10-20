@@ -147,6 +147,43 @@ class StageKernelTest(unittest.TestCase):
             self.assertEqual((development / "usr/lib/modules" / abi / "build").resolve(), headers)
             self.assertEqual((development / "usr/lib/modules" / abi / "source").resolve(), development / "usr/src" / stage.COMMON_HEADERS)
 
+    def test_arm64_runtime_tar_preserves_installed_device_trees_for_its_abi(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            abi = kernel_arch.kernel_abi("arm64")
+            build = source / "debian/build" / kernel_arch.build_directory("arm64")
+            for relative in (
+                "output/image/boot/vmlinuz-" + abi,
+                "output/image/lib/modules/" + abi + "/kernel/dummy.ko",
+                "output/image-dbg/boot/vmlinux-" + abi,
+                "output/image-dbg/lib/modules/" + abi + "/kernel/dummy.ko",
+                "System.map", ".config",
+            ):
+                path = build / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+            for relative in ("debian/build/source_sonic/Makefile", "debian/copyright", "debian/changelog"):
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture")
+            for relative in ("include", "arch/arm64/include"):
+                (build / relative).mkdir(parents=True)
+            installed = build / "output/image/usr/lib" / ("linux-image-" + abi)
+            device_tree = installed / "marvell/armada-7040-db.dtb"
+            device_tree.parent.mkdir(parents=True)
+            payload = b"\xd0\x0d\xfe\xed" + b"installed ARM64 device tree"
+            device_tree.write_bytes(payload)
+            with patch.object(stage, "stage_headers"), patch.object(stage, "validate_debug_pairs", return_value={}):
+                stage.stage(source, root / "stage", root / "artifacts", "arm64")
+            with tarfile.open(root / "artifacts/kernel-runtime.tar") as archive:
+                name = "usr/lib/linux-image-" + abi + "/marvell/armada-7040-db.dtb"
+                self.assertEqual(archive.extractfile(name).read(), payload)
+                self.assertFalse(any("sonic-amd64" in item.name for item in archive))
+            installed.rename(installed.with_name("linux-image-" + kernel_arch.kernel_abi("amd64")))
+            with self.assertRaisesRegex(ValueError, "device trees.*another ABI"):
+                stage.stage(source, root / "wrong-abi-stage", root / "wrong-abi-artifacts", "arm64")
+
     def test_arm64_debugger_verifies_matching_kernel_and_module_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -5,7 +5,7 @@ three filesystem layers with one provenance manifest:
 
 | Target | Artifact | Installed content |
 | --- | --- | --- |
-| `//:runtime_tar` | `kernel-runtime.tar` | `/boot/vmlinuz-*`, config, real System.map, and signed modules under `/usr/lib/modules/<ABI>` |
+| `//:runtime_tar` | `kernel-runtime.tar` | `/boot/vmlinuz-*`, config, real System.map, signed modules under `/usr/lib/modules/<ABI>`, and ARM64 device trees under `/usr/lib/linux-image-<ABI>` |
 | `//:debug_tar` | `kernel-debug.tar` | Matching unstripped vmlinux/modules, GNU build-ID links, patched sources and generated headers |
 | `//:development_tar` | `kernel-development.tar` | Configured common/native headers, Module.symvers, BTF, kbuild programs, and relative build/source links |
 | `//:manifest` | `kernel-artifacts.json` | Schema 2: source/tool identities, TAR kinds/hashes/sizes, and verified debug pairing |

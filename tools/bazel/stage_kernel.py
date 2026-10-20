@@ -193,6 +193,14 @@ def stage(source, staging, artifacts, architecture="amd64"):
     image, symbols = build / "output/image", build / "output/image-dbg"
     copy(image / "boot", runtime / "boot")
     copy(image / "lib/modules", runtime / "usr/lib/modules")
+    if architecture == "arm64":
+        # Debian's build_image installs native ARM64 device trees separately
+        # from /boot and /lib/modules. Retain their installed ABI directory.
+        device_trees = image / "usr/lib" / ("linux-image-" + abi)
+        require(sorted((image / "usr/lib").glob("linux-image-*")) == [device_trees]
+                and device_trees.is_dir() and not device_trees.is_symlink(),
+                "ARM64 device trees are missing or belong to another ABI")
+        copy(device_trees, runtime / device_trees.relative_to(image))
     # Preserve the real map, and match Debian's config filtering of ephemeral keys.
     copy(build / "System.map", runtime / ("boot/System.map-" + abi))
     config = (build / ".config").read_text().splitlines(keepends=True)
