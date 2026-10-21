@@ -93,19 +93,23 @@ kernel/module flow and consumes the debug package when requested.
 CI builds from source independently on `ubuntu-24.04` AMD64 and
 `ubuntu-24.04-arm` ARM64, then proves a fresh read-only remote-cache hit. A fresh
 native Trixie container installs all five DEBs with apt, verifies dpkg package
-identities/configuration, verifies the postinst-generated ABI initramfs, compiles
-an external module using installed headers/kbuild, and checks its native ELF
+identities/configuration and ARM64 device trees, verifies the postinst-generated
+ABI initramfs, compiles an external module using installed headers/kbuild, and checks its native ELF
 architecture and vermagic. GDB then verifies installed build-ID symbol selection,
 `start_kernel` and representative module source lines, and `struct task_struct`
 without access to the compiler tree or debuginfod.
 
-Successful CI publishes only five DEBs, `kernel-packages.json`, `validation.json`
-and `resolution.json`. A strict collector validates the exact package and manifest
-contracts, filesystem payload paths, source/tool identity, native architecture,
-cache proof, installation and debugger receipts before copying files. Failed jobs
-publish only a fixed incomplete-validation summary. Raw execution logs, profiles,
-module lockfile extension state, environment values and cache diagnostics remain
-private. Public artifacts expire after seven days.
+Successful CI publishes the five verified DEBs and a compact `validation.json`
+with the checkout revision, architecture, package and manifest hashes, and
+cache/install/debug check results. The collector checks those receipts and the
+copied bytes; package validation remains with the build, cache and installed-package
+checks above. Failed jobs publish only a fixed incomplete-validation summary.
+
+The full `kernel-packages.json` remains an unchanged Bazel output for consumers
+such as buildimage. CI keeps it, the generated module locks/graphs, raw logs,
+profiles and cache diagnostics private instead of copying or sanitizing their
+contents into the public artifact. The previous public `resolution.json` is no
+longer produced. Public artifacts expire after seven days.
 
 The five source-owned regression-test targets cover input identity, actual Debian
 control fixtures, cache provenance, debug pairing, launcher architecture and the

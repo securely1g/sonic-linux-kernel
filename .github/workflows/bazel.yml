@@ -21,12 +21,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: python3 tools/bazel/kernel_action_test.py
-      - run: python3 tools/bazel/stage_kernel_test.py
-      - run: python3 tools/bazel/build_test.py
-      - run: python3 tools/bazel/verify_cache_test.py
-      - run: python3 tools/bazel/collect_ci_artifacts_test.py
-      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_arch.py tools/bazel/kernel_action.py tools/bazel/stage_kernel.py tools/bazel/verify_debug.py tools/bazel/verify_install.py tools/bazel/verify_cache.py tools/bazel/collect_ci_artifacts.py
+      - run: python3 -m unittest discover -s tools/bazel -p '*_test.py'
+      - run: python3 -m compileall -q tools/bazel
 
   source-and-cache:
     name: ${{ matrix.name }} VS kernel source and remote cache
@@ -194,7 +190,7 @@ jobs:
       - name: Collect private cache service diagnostics
         if: always()
         run: docker logs sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache.log" 2>&1 || true
-      - name: Create public-safe Debian packages and evidence
+      - name: Collect verified Debian packages and a validation summary
         id: collect
         if: always()
         env:
@@ -204,14 +200,16 @@ jobs:
             --architecture '${{ matrix.architecture }}' \
             --private-root "$RUNNER_TEMP/kernel-private" --source-root "$GITHUB_WORKSPACE" \
             --output "$RUNNER_TEMP/kernel-artifacts" --job-status "$KERNEL_JOB_STATUS"
-      - name: Retain Debian packages and allowlisted cache evidence
+      - name: Upload Debian packages and validation summary
         if: always() && steps.collect.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kernel-${{ matrix.architecture }}-vs-cache-evidence
           retention-days: 7
           if-no-files-found: error
-          path: ${{ runner.temp }}/kernel-artifacts
+          path: |
+            ${{ runner.temp }}/kernel-artifacts/*.deb
+            ${{ runner.temp }}/kernel-artifacts/validation.json
       - name: Stop this job's cache
         if: always()
         run: docker rm -f sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache-stop.log" 2>&1 || true

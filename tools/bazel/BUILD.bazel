@@ -18,6 +18,7 @@ py_test(
         "kernel_action.py",
         "kernel_action_test.py",
         "kernel_arch.py",
+        "verify_install.py",
     ],
     main = "kernel_action_test.py",
 )
@@ -51,7 +52,6 @@ py_test(
         "kernel_action.py",
         "kernel_arch.py",
     ],
-    data = ["//:.github/workflows/bazel.yml"],
     main = "collect_ci_artifacts_test.py",
 )
 

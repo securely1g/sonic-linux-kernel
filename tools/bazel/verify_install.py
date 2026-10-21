@@ -10,6 +10,13 @@ from kernel_action import ARCHITECTURES, PACKAGE_VERSION, package_names, kernel_
 from kernel_arch import elf_machine
 
 
+def verify_device_trees(root, architecture):
+    if architecture == "arm64":
+        directory = root / "usr/lib" / ("linux-image-" + kernel_abi(architecture))
+        if not any(path.is_file() for path in directory.rglob("*.dtb")):
+            raise ValueError("ARM64 kernel package did not install device trees for its ABI")
+
+
 def verify(architecture):
     abi = kernel_abi(architecture)
     packages = []
@@ -26,6 +33,7 @@ def verify(architecture):
     initramfs = Path("/boot/initrd.img-" + abi)
     if not initramfs.is_file() or initramfs.stat().st_size == 0:
         raise ValueError("Debian postinst did not produce the ABI initramfs")
+    verify_device_trees(Path("/"), architecture)
     with tempfile.TemporaryDirectory(prefix="kernel-header-check-") as temporary:
         directory = Path(temporary)
         (directory / "Makefile").write_text("obj-m += sonic_header_check.o\n")

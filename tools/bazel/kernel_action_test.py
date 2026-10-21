@@ -11,10 +11,25 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kernel_action as action
+import verify_install
 from deb_test_support import write_deb
 
 
 class KernelActionTest(unittest.TestCase):
+    def test_installed_arm64_package_requires_device_trees_for_its_abi(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            verify_install.verify_device_trees(root, "amd64")
+            wrong = root / "usr/lib/linux-image-wrong-abi/vendor/board.dtb"
+            wrong.parent.mkdir(parents=True)
+            wrong.write_bytes(b"wrong ABI")
+            with self.assertRaisesRegex(ValueError, "device trees for its ABI"):
+                verify_install.verify_device_trees(root, "arm64")
+            native = root / "usr/lib" / ("linux-image-" + action.kernel_abi("arm64")) / "vendor/board.dtb"
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"native device tree")
+            verify_install.verify_device_trees(root, "arm64")
+
     def test_source_identity_ignores_path_but_tracks_content_and_executable_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "first"
