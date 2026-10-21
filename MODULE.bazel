@@ -5,7 +5,7 @@ module(
 
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_python", version = "1.7.0")
-bazel_dep(name = "sonic-build-infra", version = "0.0.17-0895a066c38ca1bc291dd90cdcacacfa0acaa739", repo_name = "sonic_build_infra")
+bazel_dep(name = "sonic-build-infra", version = "0.0.17-306286c253b22b6bf2a75732c82bbf3d00e77cb7", repo_name = "sonic_build_infra")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.13")
