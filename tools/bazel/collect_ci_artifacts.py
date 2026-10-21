@@ -16,22 +16,21 @@ import tarfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kernel_action
 
-MANIFEST = "kernel-artifacts.json"
-ARTIFACT_KEYS = {"name", "kind", "sha256", "size"}
+MANIFEST = kernel_action.MANIFEST
+PACKAGE_KEYS = {"name", "kind", "package", "version", "architecture", "sha256", "size"}
 MANIFEST_KEYS = {
     "schema", "architecture", "platform", "kernel_version", "kernel_abi",
     "package_version", "signing", "source_date_epoch", "source_archives",
-    "source_tree_sha256", "source_files", "build_tools", "artifacts", "debug",
+    "source_tree_sha256", "source_files", "build_tools", "packages", "created_packages", "debug",
 }
 CONFIGURATION = {
-    "schema": 2, "architecture": "amd64", "platform": "vs", "kernel_version": "6.12.41",
+    "schema": 3, "architecture": "amd64", "platform": "vs", "kernel_version": "6.12.41",
     "kernel_abi": "6.12.41+deb13-sonic-amd64", "package_version": "6.12.41-1",
     "signing": "unsigned", "source_date_epoch": kernel_action.SOURCE_DATE_EPOCH,
 }
 PUBLIC_REGISTRIES = {
     "https://bcr.bazel.build/modules/": "bazel-central",
     "https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/main/modules/": "sonic-main",
-    "https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-build-tools-current/modules/": "sonic-draft",
 }
 PRIVATE_FILES = {
     **{run + "_" + label: run + "/" + name for run in ("cold", "hit") for label, name in (
@@ -42,7 +41,7 @@ PRIVATE_FILES = {
     "cold_lock": "cold-consumer/MODULE.bazel.lock",
     "hit_lock": "hit-consumer/MODULE.bazel.lock",
     "cache_log": "cache.log", "cache_proof": "verified/cache-proof.json",
-    "installed_debugger": "debugger.json",
+    "installed_debugger": "debugger.json", "installed_packages": "installation.json",
 }
 DIGEST = re.compile(r"[0-9a-f]{64}")
 MODULE_NAME = re.compile(r"[a-z][a-z0-9._-]{0,127}")
@@ -143,90 +142,139 @@ def checkout_inputs(source):
     return revision, inventory, sorted(archives, key=lambda item: item["name"])
 
 
-def validate_artifact(record):
-    require(isinstance(record, dict) and set(record) == ARTIFACT_KEYS,
-            "unexpected artifact record fields")
-    require(record["name"] in kernel_action.ARTIFACT_NAMES
-            and record["kind"] == kernel_action.ARTIFACT_KINDS[record["name"]],
-            "unexpected artifact name or kind")
+def validate_package(record, architecture="amd64", *, created=False):
+    expected = PACKAGE_KEYS | ({"exported"} if created else set())
+    require(isinstance(record, dict) and set(record) == expected,
+            "unexpected package record fields")
+    require(isinstance(record["package"], str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9+.-]{1,127}", record["package"])
+            and record["version"] == CONFIGURATION["package_version"]
+            and record["architecture"] in (architecture, "all"),
+            "unexpected Debian package identity")
+    require(record["name"] == "_".join(record[key] for key in ("package", "version", "architecture")) + ".deb",
+            "package filename differs from its identity")
+    kinds = kernel_action.package_kinds(architecture)
+    require(record["kind"] == kinds.get(record["name"], "other")
+            and (created or record["name"] in kinds), "unexpected package name or kind")
+    if created:
+        require(record["exported"] is (record["name"] in kinds), "invalid created-package export marker")
     require(type(record["size"]) is int and 0 < record["size"] <= 2**40
             and isinstance(record["sha256"], str) and DIGEST.fullmatch(record["sha256"]),
-            "invalid artifact size or digest")
+            "invalid package size or digest")
 
 
-def validate_tar(path, kind, architecture="amd64", *, debugger_sources=()):
-    """Check the actual archive namespace without extracting or executing files."""
-    names, regular, links, modules = set(), set(), {}, set()
+def validate_payload(archive, kind, architecture="amd64", *, debugger_sources=()):
+    """Inspect the decoded Debian payload without extracting or executing it."""
+    names, regular, symlinks, hardlinks, modules = set(), set(), {}, {}, set()
     abi = configuration(architecture)["kernel_abi"]
-    with tarfile.open(path, mode="r:") as archive:
-        for member in archive:
-            raw = PurePosixPath(member.name)
-            require(not raw.is_absolute() and ".." not in raw.parts,
-                    "unsafe TAR member path")
-            name = str(raw)
-            if name == ".":
-                require(member.isdir(), "invalid TAR root")
-                continue
-            require(name not in names, "duplicate TAR member")
-            names.add(name)
-            require(member.isfile() or member.isdir() or member.issym(), "unsupported TAR member type")
-            require(member.uid == 0 and member.gid == 0 and not member.mode & 0o6000,
-                    "unsafe TAR ownership or permissions")
-            require(not name.endswith((".deb", ".udeb", ".ddeb")), "DEB payload in TAR output")
-            if member.issym():
-                require(member.linkname and "\x00" not in member.linkname, "invalid TAR link")
-                target = PurePosixPath(member.linkname)
-                # Absolute header links intentionally name paths in the installed
-                # filesystem. Relative links may climb only within that root.
+    for member in archive:
+        raw = PurePosixPath(member.name)
+        require(not raw.is_absolute() and ".." not in raw.parts, "unsafe package member path")
+        name = str(raw)
+        if name == ".":
+            require(member.isdir(), "invalid package root")
+            continue
+        require(name not in names, "duplicate package member")
+        names.add(name)
+        require(member.isfile() or member.isdir() or member.issym() or member.islnk(),
+                "unsupported package member type")
+        require(member.uid == 0 and member.gid == 0 and not member.mode & 0o6000,
+                "unsafe package ownership or permissions")
+        if member.issym() or member.islnk():
+            require(member.linkname and "\x00" not in member.linkname, "invalid package link")
+            target = PurePosixPath(member.linkname)
+            if member.islnk():
+                require(not target.is_absolute() and ".." not in target.parts,
+                        "unsafe package hardlink")
+                hardlinks[name] = str(target)
+            else:
+                # Header links may be absolute in the installed filesystem.
+                # A relative link may climb only within that installation root.
                 parts = [] if target.is_absolute() else list(raw.parent.parts)
                 for part in target.parts:
                     if part in ("/", "."):
                         continue
                     if part == "..":
-                        require(parts, "TAR link escapes installation root")
+                        require(parts, "package link escapes installation root")
                         parts.pop()
                     else:
                         parts.append(part)
-                links[name] = "/".join(parts)
-            if member.isfile():
-                regular.add(name)
-                if re.search(r"\.ko(?:\.xz|\.gz|\.zst)?$", name):
-                    modules.add(name)
-        require(not any(str(parent) in links for name in names
-                        for parent in PurePosixPath(name).parents),
-                "TAR member descends through a symlink")
-        if kind == "runtime":
-            required = {"boot/vmlinuz-" + abi, "boot/config-" + abi}
-            require(required <= regular and modules, "runtime TAR lacks kernel or modules")
-            require(all(name.startswith(("lib/modules/" + abi + "/", "usr/lib/modules/" + abi + "/"))
-                        for name in modules), "runtime TAR contains modules for another ABI")
-            require(not any(name.startswith("usr/lib/debug/") for name in regular),
-                    "debug payload in runtime TAR")
-            device_trees = {name for name in regular if name.endswith((".dtb", ".dtbo"))}
-            require(all(name.startswith("usr/lib/linux-image-" + abi + "/") for name in device_trees),
-                    "runtime TAR contains device trees for another ABI")
-            if architecture == "arm64":
-                require(any(name.endswith(".dtb") for name in device_trees),
-                        "ARM64 runtime TAR lacks device trees")
-        elif kind == "debug":
-            require("usr/lib/debug/boot/vmlinux-" + abi in regular and modules,
-                    "debug TAR lacks kernel symbols or modules")
-            require(all("usr/src/debug/linux-" + abi + "/" + name in regular for name in debugger_sources),
-                    "debugger source is absent from the debug TAR")
-            require(all(name.startswith("usr/lib/debug/") and name.endswith(".ko") for name in modules),
-                    "debug TAR contains misplaced or compressed modules")
-            require(all(name.startswith(("usr/lib/debug/", "usr/share/doc/", "usr/src/debug/linux-" + abi + "/"))
-                        for name in regular), "runtime payload in debug TAR")
-        elif kind == "development":
-            headers = "usr/src/linux-headers-" + abi + "/"
-            require({headers + ".config", headers + "Module.symvers", headers + "Makefile"} <= regular,
-                    "development TAR lacks usable configured headers")
-            require(any(name.startswith("usr/lib/linux-kbuild-") for name in regular),
-                    "development TAR lacks kbuild tools")
-            require(not modules, "runtime modules in development TAR")
-        else:
-            raise CollectionError("unexpected artifact kind")
+                symlinks[name] = "/".join(parts)
+        if member.isfile():
+            regular.add(name)
+    require(not any(str(parent) in symlinks or str(parent) in hardlinks or str(parent) in regular
+                    for name in names for parent in PurePosixPath(name).parents),
+            "package member descends through a non-directory")
+    require(all(target in regular for target in hardlinks.values()),
+            "package hardlink does not name a regular payload file")
+    regular.update(hardlinks)
+    modules = {name for name in regular if re.search(r"\.ko(?:\.xz|\.gz|\.zst)?$", name)}
+    if kind == "runtime":
+        required = {"boot/vmlinuz-" + abi, "boot/config-" + abi}
+        require(required <= regular and modules, "runtime package lacks kernel or modules")
+        require(all(name.startswith(("lib/modules/" + abi + "/", "usr/lib/modules/" + abi + "/"))
+                    for name in modules), "runtime package contains modules for another ABI")
+        require(not any(name.startswith("usr/lib/debug/") for name in regular),
+                "debug payload in runtime package")
+        device_trees = {name for name in regular if name.endswith((".dtb", ".dtbo"))}
+        require(all(name.startswith("usr/lib/linux-image-" + abi + "/") for name in device_trees),
+                "runtime package contains device trees for another ABI")
+        if architecture == "arm64":
+            require(any(name.endswith(".dtb") for name in device_trees),
+                    "ARM64 runtime package lacks device trees")
+    elif kind == "debug":
+        require("usr/lib/debug/boot/vmlinux-" + abi in regular and modules,
+                "debug package lacks kernel symbols or modules")
+        require(all("usr/src/debug/linux-" + abi + "/" + name in regular for name in debugger_sources),
+                "debugger source is absent from the debug package")
+        require(all(name.startswith("usr/lib/debug/") and name.endswith(".ko") for name in modules),
+                "debug package contains misplaced or compressed modules")
+        require(all(name.startswith(("usr/lib/debug/", "usr/share/doc/", "usr/src/debug/linux-" + abi + "/"))
+                    for name in regular), "runtime payload in debug package")
+    elif kind == "headers":
+        headers = "usr/src/linux-headers-" + abi + "/"
+        require({headers + ".config", headers + "Module.symvers", headers + "Makefile"} <= regular,
+                "headers package lacks usable configured headers")
+        require(not modules, "runtime modules in headers package")
+    elif kind == "headers_common":
+        headers = "usr/src/linux-headers-6.12.41+deb13-common-sonic/"
+        require(headers + "Makefile" in regular and any(name.startswith(headers + "include/") for name in regular),
+                "common headers package lacks source headers")
+        require(not modules, "runtime modules in common headers package")
+    elif kind == "kbuild":
+        require("usr/lib/linux-kbuild-6.12.41+deb13/scripts/mod/modpost" in regular,
+                "kbuild package lacks module build tools")
+        require(not modules, "runtime modules in kbuild package")
+    else:
+        raise CollectionError("unexpected package kind")
     return modules
+
+
+def validate_deb(path, record, architecture="amd64", *, debugger_sources=()):
+    """Use dpkg's decoder for both control metadata and the filesystem stream."""
+    validate_package(record, architecture)
+    control = subprocess.run([
+        "dpkg-deb", "--show", "--showformat=${Package}\n${Version}\n${Architecture}\n", str(path),
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60)
+    require(control.returncode == 0 and control.stdout.splitlines()
+            == [record[key] for key in ("package", "version", "architecture")],
+            "Debian control identity differs from manifest")
+    process = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", str(path)],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+            modules = validate_payload(archive, record["kind"], architecture, debugger_sources=debugger_sources)
+        # Consume trailing TAR padding before waiting, so a full pipe cannot
+        # deadlock dpkg-deb after the TAR end marker.
+        for _chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+            pass
+        require(process.wait(timeout=60) == 0, "Debian package payload could not be decoded")
+        return modules
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
 
 
 def validate_manifest(manifest, inventory, archives, architecture="amd64"):
@@ -254,13 +302,22 @@ def validate_manifest(manifest, inventory, archives, architecture="amd64"):
         isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9+.-]{0,127}", name)
         and isinstance(version, str) and re.fullmatch(r"[0-9][A-Za-z0-9.+:~_-]{0,127}", version)
         for name, version in packages.items()), "invalid build-tools package inventory")
-    records = manifest["artifacts"]
-    require(isinstance(records, list) and len(records) == 3, "expected three exported TARs")
+    records = manifest["packages"]
+    require(isinstance(records, list) and len(records) == 5, "expected five exported Debian packages")
     for record in records:
-        validate_artifact(record)
+        validate_package(record, architecture)
     require(records == sorted(records, key=lambda item: item["name"])
-            and {item["name"] for item in records} == kernel_action.ARTIFACT_NAMES,
-            "unexpected exported artifact set")
+            and {item["name"] for item in records} == kernel_action.package_names(architecture),
+            "unexpected exported package set")
+    created = manifest["created_packages"]
+    require(isinstance(created, list) and 5 <= len(created) <= 256, "invalid created-package inventory")
+    for record in created:
+        validate_package(record, architecture, created=True)
+    require(created == sorted(created, key=lambda item: item["name"])
+            and len({item["name"] for item in created}) == len(created)
+            and [{key: value for key, value in item.items() if key != "exported"}
+                 for item in created if item["exported"]] == records,
+            "created and exported package inventories differ")
     debug = manifest["debug"]
     require(isinstance(debug, dict) and set(debug) == {
         "kernel_build_id", "module_count", "module_build_ids_sha256",
@@ -301,6 +358,26 @@ def public_debugger(private, architecture="amd64"):
     return result
 
 
+def public_installation(private, packages, architecture="amd64"):
+    result = read_json(file_at(private, "installation.json"), 16 * 1024)
+    require(isinstance(result, dict) and set(result) == {
+        "schema", "result", "architecture", "installed_packages", "initramfs", "external_module", "module_vermagic",
+    } and type(result["schema"]) is int and result["schema"] == 1
+            and result["result"] == "passed" and result["architecture"] == architecture
+            and result["initramfs"] is True and result["external_module"] is True,
+            "installed Debian package verification did not pass")
+    expected = sorted([
+        {**{key: record[key] for key in ("package", "version", "architecture")}, "status": "install ok installed"}
+        for record in packages
+    ], key=lambda item: item["package"])
+    require(result["installed_packages"] == expected, "installed Debian identities differ from exported packages")
+    vermagic = result["module_vermagic"]
+    require(isinstance(vermagic, str) and re.fullmatch(r"[A-Za-z0-9_+. -]{1,256}", vermagic)
+            and vermagic.split() and vermagic.split()[0] == configuration(architecture)["kernel_abi"],
+            "installed header module has unexpected vermagic")
+    return result
+
+
 def safe_metrics(value):
     if not isinstance(value, dict):
         return {}
@@ -325,7 +402,7 @@ def public_proof(private, architecture="amd64"):
             and proof.get("architecture") == architecture,
             "cache verification did not pass")
     hashes = proof.get("outputs_sha256")
-    names = kernel_action.ARTIFACT_NAMES | {MANIFEST}
+    names = kernel_action.package_names(architecture) | {MANIFEST}
     require(isinstance(hashes, dict) and set(hashes) == names and all(
         isinstance(value, str) and DIGEST.fullmatch(value) for value in hashes.values()), "invalid cache output digests")
     return {
@@ -440,7 +517,7 @@ def collect(private, source, output, job_status, architecture="amd64"):
     temporary = Path(tempfile.mkdtemp(prefix=".kernel-artifacts-", dir=output.parent))
     try:
         validation = {
-            "schema": 1, "artifact_policy": "allowlisted-kernel-ci-v2", "job_status": job_status,
+            "schema": 1, "artifact_policy": "allowlisted-kernel-ci-v3", "job_status": job_status,
             "result": "incomplete", "artifacts_published": False, "private_evidence_present": presence,
         }
         if job_status == "success":
@@ -450,16 +527,17 @@ def collect(private, source, output, job_status, architecture="amd64"):
             validate_manifest(manifest, inventory, archives, architecture)
             proof = public_proof(private, architecture)
             debugger = public_debugger(private, architecture)
+            installation = public_installation(private, manifest["packages"], architecture)
             module_sets = {}
-            for name in sorted(kernel_action.ARTIFACT_NAMES | {MANIFEST}):
+            for name in sorted(kernel_action.package_names(architecture) | {MANIFEST}):
                 path = file_at(private, "verified/" + name)
                 require(kernel_action.sha256(path) == proof["outputs_sha256"][name], "verified output digest differs")
                 if name != MANIFEST:
-                    record = next(item for item in manifest["artifacts"] if item["name"] == name)
+                    record = next(item for item in manifest["packages"] if item["name"] == name)
                     require(path.stat().st_size == record["size"] and proof["outputs_sha256"][name] == record["sha256"],
                             "verified artifact differs from manifest")
-                    module_sets[record["kind"]] = validate_tar(
-                        path, record["kind"], architecture,
+                    module_sets[record["kind"]] = validate_deb(
+                        path, record, architecture,
                         debugger_sources=[debugger[key]["source"] for key in ("kernel", "module")])
                 destination = temporary / name
                 shutil.copyfile(path, destination)
@@ -472,7 +550,7 @@ def collect(private, source, output, job_status, architecture="amd64"):
             require(runtime_modules == debug_modules and len(runtime_modules) == manifest["debug"]["module_count"],
                     "runtime and debug module inventories differ")
             expected_debug_module = expected_configuration["kernel_abi"] + "/" + debugger["module"]["path"]
-            require(expected_debug_module in debug_modules, "debugger module is absent from debug TAR")
+            require(expected_debug_module in debug_modules, "debugger module is absent from debug package")
             cold, cold_summary = redacted_resolution(private, "cold")
             hit, hit_summary = redacted_resolution(private, "hit")
             require(cold == hit, "selected source and consumer module resolution differs")
@@ -485,8 +563,9 @@ def collect(private, source, output, job_status, architecture="amd64"):
             write_json(temporary, "resolution.json", resolution)
             validation.update({
                 "result": "passed", "artifacts_published": True, "checkout_revision": revision,
-                "configuration": {**expected_configuration, "distribution": "trixie", "target": "@sonic_linux_kernel//:kernel_artifacts"},
-                "cache_proof": proof, "debugger": debugger, "selected_module_count": len(cold["modules"]),
+                "configuration": {**expected_configuration, "distribution": "trixie", "target": "@sonic_linux_kernel//:kernel_packages"},
+                "cache_proof": proof, "debugger": debugger, "installation": installation,
+                "selected_module_count": len(cold["modules"]),
             })
         write_json(temporary, "validation.json", validation)
         require(not output.exists() and not output.is_symlink(), "artifact destination appeared during collection")

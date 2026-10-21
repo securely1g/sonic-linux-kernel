@@ -7,12 +7,12 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-import tarfile
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import verify_cache as proof
+from deb_test_support import write_deb
 
 
 def record(hit=False, runner="local"):
@@ -23,19 +23,14 @@ def record(hit=False, runner="local"):
 
 def outputs_fixture(root, architecture="amd64"):
     root.mkdir(parents=True, exist_ok=True)
-    names = sorted(proof.ARTIFACT_KINDS)
+    names = sorted(proof.package_kinds(architecture))
     records = []
     for name in names:
         path = root / name
-        with tarfile.open(path, "w") as archive:
-            data = b"fixture-source-output"
-            member = tarfile.TarInfo("usr/share/example")
-            member.size = len(data)
-            archive.addfile(member, io.BytesIO(data))
-        records.append({"name": name, "kind": proof.ARTIFACT_KINDS[name],
-                        "size": path.stat().st_size, "sha256": proof.sha256(path)})
+        write_deb(path)
+        records.append(proof.package_record(path, architecture))
     (root / proof.MANIFEST).write_text(json.dumps({
-        "schema": 2, "architecture": architecture, "kernel_abi": proof.kernel_abi(architecture), "artifacts": records,
+        "schema": 3, "architecture": architecture, "kernel_abi": proof.kernel_abi(architecture), "packages": records,
     }))
     (root / "output-paths.txt").write_text("\n".join("/work/" + name for name in names + [proof.MANIFEST]))
     (root / "invocation.json").write_text(json.dumps({"disk_cache": None, "architecture": architecture}))
@@ -81,7 +76,7 @@ class CacheProofTest(unittest.TestCase):
                     proof.outputs(root)
 
 
-    def test_accepts_identical_tar_outputs_from_remote_cache(self):
+    def test_accepts_identical_debian_outputs_from_remote_cache(self):
         for architecture in ("amd64", "arm64"):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -91,7 +86,7 @@ class CacheProofTest(unittest.TestCase):
                     (path / "execution.json").write_text(json.dumps(action))
                 receipt = proof.verify(cold, hit, root / "evidence", architecture)
                 self.assertEqual(receipt["architecture"], architecture)
-                self.assertEqual(set(receipt["outputs_sha256"]), set(proof.ARTIFACT_KINDS) | {proof.MANIFEST})
+                self.assertEqual(set(receipt["outputs_sha256"]), set(proof.package_kinds(architecture)) | {proof.MANIFEST})
                 self.assertTrue(receipt["kernel_compilation_skipped"])
                 with self.assertRaisesRegex(ValueError, "already exists"):
                     proof.verify(cold, hit, root / "evidence", architecture)
@@ -119,7 +114,7 @@ class CacheProofTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invocation architecture"):
                 proof.verify(cold, hit, root / "evidence", "arm64")
 
-    def test_rejects_changed_tar_manifest_and_symlink_outputs(self):
+    def test_rejects_changed_debian_manifest_and_symlink_outputs(self):
         for change in ("bytes", "duplicate", "kind", "symlink", "schema"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -127,33 +122,33 @@ class CacheProofTest(unittest.TestCase):
                 path = root / proof.MANIFEST
                 manifest = json.loads(path.read_text())
                 if change == "bytes":
-                    (root / "kernel-runtime.tar").write_bytes(b"changed")
+                    (root / next(name for name, kind in proof.package_kinds().items() if kind == "runtime")).write_bytes(b"changed")
                 elif change == "duplicate":
-                    manifest["artifacts"][1] = manifest["artifacts"][0]
+                    manifest["packages"][1] = manifest["packages"][0]
                 elif change == "kind":
-                    manifest["artifacts"][0]["kind"] = "runtime"
+                    manifest["packages"][0]["kind"] = "invalid"
                 elif change == "schema":
                     manifest["schema"] = 1
                 else:
-                    data = root / "kernel-runtime.tar"
+                    data = root / next(name for name, kind in proof.package_kinds().items() if kind == "runtime")
                     data.rename(root / "real-output")
                     data.symlink_to("real-output")
                 path.write_text(json.dumps(manifest))
                 with self.assertRaises(ValueError):
                     proof.outputs(root)
 
-    def test_rejects_non_tar_payload_even_when_hashes_match(self):
+    def test_rejects_non_debian_payload_even_when_hashes_match(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             outputs_fixture(root)
-            path = root / "kernel-runtime.tar"
+            path = root / next(name for name, kind in proof.package_kinds().items() if kind == "runtime")
             path.write_bytes(b"!<arch>\nnot-a-tar")
             manifest_path = root / proof.MANIFEST
             manifest = json.loads(manifest_path.read_text())
-            record = next(item for item in manifest["artifacts"] if item["name"] == path.name)
+            record = next(item for item in manifest["packages"] if item["name"] == path.name)
             record.update(size=path.stat().st_size, sha256=proof.sha256(path))
             manifest_path.write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(ValueError, "not a TAR"):
+            with self.assertRaisesRegex(ValueError, "not a valid Debian"):
                 proof.outputs(root)
 
     def test_cli_omits_arbitrary_execution_fields(self):

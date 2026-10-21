@@ -7,9 +7,9 @@ import json
 from pathlib import Path, PurePosixPath
 import shutil
 import re
-import tarfile
+import subprocess
 
-from kernel_action import ARCHITECTURES, kernel_abi
+from kernel_action import ARCHITECTURES, MANIFEST, kernel_abi, package_kinds, package_record
 
 
 def require(condition, message):
@@ -50,12 +50,6 @@ def kernel_record(directory):
     return entry
 
 
-ARTIFACT_KINDS = {
-    "kernel-runtime.tar": "runtime", "kernel-debug.tar": "debug",
-    "kernel-development.tar": "development",
-}
-MANIFEST = "kernel-artifacts.json"
-
 
 def unique_object(pairs):
     result = {}
@@ -77,20 +71,20 @@ def outputs(directory, architecture="amd64"):
         require(path.is_file() and path.name not in found, "missing or duplicate kernel output")
         path.resolve().relative_to(directory.resolve())
         found[path.name] = path
-    require(set(found) == set(ARTIFACT_KINDS) | {MANIFEST}, "expected three TARs and their manifest")
+    require(set(found) == set(package_kinds(architecture)) | {MANIFEST}, "expected five Debian packages and their manifest")
     manifest = json.loads(found[MANIFEST].read_text(), object_pairs_hook=unique_object)
-    require(type(manifest.get("schema")) is int and manifest["schema"] == 2,
-            "expected TAR manifest schema 2")
+    require(type(manifest.get("schema")) is int and manifest["schema"] == 3,
+            "expected Debian package manifest schema 3")
     require(manifest.get("architecture") == architecture and manifest.get("kernel_abi") == kernel_abi(architecture),
             "kernel manifest architecture or ABI differs from cache proof")
-    records = manifest.get("artifacts")
-    require(isinstance(records, list) and len(records) == 3, "manifest must describe three TARs")
+    records = manifest.get("packages")
+    require(isinstance(records, list) and len(records) == 5, "manifest must describe five Debian packages")
     names = []
     for artifact in records:
-        require(isinstance(artifact, dict) and set(artifact) == {"name", "kind", "sha256", "size"},
+        require(isinstance(artifact, dict) and set(artifact) == {"name", "kind", "sha256", "size", "package", "version", "architecture"},
                 "unexpected artifact record fields")
         name = artifact["name"]
-        require(name in ARTIFACT_KINDS and artifact["kind"] == ARTIFACT_KINDS[name],
+        require(name in package_kinds(architecture) and artifact["kind"] == package_kinds(architecture)[name],
                 "unexpected artifact name or kind")
         names.append(name)
         path = found[name]
@@ -98,9 +92,13 @@ def outputs(directory, architecture="amd64"):
                 and isinstance(artifact["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]),
                 "invalid artifact size or digest")
         require(sha256(path) == artifact["sha256"] and path.stat().st_size == artifact["size"],
-                "kernel TAR bytes differ from manifest")
-        require(tarfile.is_tarfile(path), "kernel output is not a TAR archive")
-    require(names == sorted(ARTIFACT_KINDS), "duplicate or unordered artifact inventory")
+                "kernel package bytes differ from manifest")
+        try:
+            metadata = package_record(path, architecture)
+        except (subprocess.CalledProcessError, ValueError) as error:
+            raise ValueError("kernel output is not a valid Debian package") from error
+        require(metadata == artifact, "Debian control metadata differs from manifest")
+    require(names == sorted(package_kinds(architecture)), "duplicate or unordered artifact inventory")
     return found
 
 
@@ -121,7 +119,7 @@ def verify(cold, hit, destination, architecture="amd64"):
     first_outputs, second_outputs = outputs(cold, architecture), outputs(hit, architecture)
     hashes = {name: sha256(path) for name, path in first_outputs.items()}
     require(hashes == {name: sha256(path) for name, path in second_outputs.items()},
-            "cached TARs differ from freshly compiled TARs")
+            "cached Debian packages differ from freshly compiled packages")
     require(not destination.exists() and not destination.is_symlink(), "artifact destination already exists")
     destination.mkdir(parents=True)
     for name, path in second_outputs.items():

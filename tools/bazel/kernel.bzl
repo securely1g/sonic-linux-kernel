@@ -3,13 +3,22 @@
 load("@sonic_build_infra//tools/build_tools:defs.bzl", "PythonRuntimeInfo")
 load(":sources.bzl", "KERNEL_SOURCES")
 
-_ARTIFACTS = ["kernel-runtime.tar", "kernel-debug.tar", "kernel-development.tar"]
+def _packages(architecture):
+    abi = "6.12.41+deb13-sonic-" + architecture
+    suffix = "_6.12.41-1_" + architecture + ".deb"
+    return [
+        "linux-image-" + abi + "-unsigned" + suffix,
+        "linux-image-" + abi + "-dbg" + suffix,
+        "linux-headers-" + abi + suffix,
+        "linux-headers-6.12.41+deb13-common-sonic_6.12.41-1_all.deb",
+        "linux-kbuild-6.12.41+deb13" + suffix,
+    ]
 
-def _kernel_artifacts_impl(ctx):
+def _kernel_packages_impl(ctx):
     python = ctx.attr._python[PythonRuntimeInfo]
     architecture = ctx.attr.architecture
-    outputs = [ctx.actions.declare_file(architecture + "/" + name) for name in _ARTIFACTS]
-    manifest = ctx.actions.declare_file(architecture + "/kernel-artifacts.json")
+    outputs = [ctx.actions.declare_file(architecture + "/" + name) for name in _packages(architecture)]
+    manifest = ctx.actions.declare_file(architecture + "/kernel-packages.json")
     config = ctx.actions.declare_file(ctx.label.name + ".action.json")
     source_root = ctx.file.makefile.dirname + "/" if ctx.file.makefile.dirname else ""
     sources = []
@@ -22,7 +31,7 @@ def _kernel_artifacts_impl(ctx):
         source = KERNEL_SOURCES[name]
         archives.append({"path": src.path, "name": source.name, "sha256": source.sha256})
     ctx.actions.write(config, json.encode({
-        "schema": 2,
+        "schema": 3,
         "architecture": architecture,
         "sources": sources,
         "archives": archives,
@@ -44,7 +53,7 @@ def _kernel_artifacts_impl(ctx):
             "PYTHONHASHSEED": "0",
         },
         mnemonic = "SonicKernelBuild",
-        progress_message = "Compiling SONiC 6.12.41 %s VS kernel runtime/debug/development TARs" % architecture.upper(),
+        progress_message = "Compiling SONiC 6.12.41 %s VS kernel Debian image/debug/headers/kbuild packages" % architecture.upper(),
         execution_requirements = {"block-network": "", "no-remote-exec": "1"},
     )
     return [
@@ -52,13 +61,13 @@ def _kernel_artifacts_impl(ctx):
         OutputGroupInfo(
             runtime = depset([outputs[0]]),
             debug = depset([outputs[1]]),
-            development = depset([outputs[2]]),
+            development = depset(outputs[2:]),
             manifest = depset([manifest]),
         ),
     ]
 
-kernel_artifacts = rule(
-    implementation = _kernel_artifacts_impl,
+kernel_packages = rule(
+    implementation = _kernel_packages_impl,
     attrs = {
         "architecture": attr.string(mandatory = True, values = ["amd64", "arm64"]),
         "srcs": attr.label_list(allow_files = True, mandatory = True),

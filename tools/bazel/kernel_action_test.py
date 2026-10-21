@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check input identity and TAR handoff without compiling a sample kernel."""
+"""Check input identity and Debian package handoff without compiling a sample kernel."""
 
 import hashlib
 import json
@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kernel_action as action
+from deb_test_support import write_deb
 
 
 class KernelActionTest(unittest.TestCase):
@@ -70,38 +71,56 @@ class KernelActionTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "identity digest"):
                         action.runtime_identity(root, architecture)
 
-    def test_action_requires_runtime_debug_and_development_tars(self):
-        config = {"outputs": sorted(action.ARTIFACT_NAMES), "manifest": "out/kernel-artifacts.json"}
-        action.validate_outputs(config)
-        for outputs in (config["outputs"][:-1], config["outputs"] + ["other.deb"],
-                        [config["outputs"][0]] * 3):
-            with self.subTest(outputs=outputs), self.assertRaisesRegex(ValueError, "exactly runtime, debug and development"):
-                action.validate_outputs(dict(config, outputs=outputs))
+    def test_action_requires_all_five_packages_for_the_selected_architecture(self):
         for architecture in action.ARCHITECTURES:
-            action.validate_outputs(dict(config, architecture=architecture))
+            config = {"architecture": architecture, "outputs": sorted(action.package_names(architecture)),
+                      "manifest": "out/" + action.MANIFEST}
+            action.validate_outputs(config)
+            for outputs in (config["outputs"][:-1], config["outputs"] + ["other.deb"],
+                            [config["outputs"][0]] * 5, sorted(action.package_names(
+                                "arm64" if architecture == "amd64" else "amd64"))):
+                with self.subTest(outputs=outputs), self.assertRaisesRegex(ValueError, "exactly five"):
+                    action.validate_outputs(dict(config, outputs=outputs))
+            with self.assertRaisesRegex(ValueError, "kernel-packages.json"):
+                action.validate_outputs(dict(config, manifest="out/other.json"))
         with self.assertRaisesRegex(ValueError, "unsupported kernel architecture"):
             action.validate_outputs(dict(config, architecture="armhf"))
-        with self.assertRaisesRegex(ValueError, "kernel-artifacts.json"):
-            action.validate_outputs(dict(config, manifest="out/other.json"))
 
-    def test_compile_recipe_selects_native_source_build_and_install_for_each_architecture(self):
+    def test_compile_recipe_keeps_maintained_debian_packaging_for_each_architecture(self):
         for architecture in action.ARCHITECTURES:
             with self.subTest(architecture=architecture):
                 commands = action.compilation_commands(architecture)
                 self.assertEqual(commands[0][0:2], ["/usr/bin/dpkg-source", "-x"])
-                self.assertIn(f"manage-config {architecture} no_sign", commands[3][-1])
-                self.assertIn(f"debian/config.local/{architecture}/config.sonic-vs", commands[3][-1])
-                self.assertIn(f"build-arch_{architecture}_sonic_{architecture}_image", commands[4])
-                self.assertIn(f"build-arch_{architecture}_kbuild", commands[4])
-                self.assertIn("sonic-install-kbuild", commands[5])
-                self.assertIn("ARCH=" + architecture, commands[5])
-                self.assertIn("KERNEL_ARCH=" + ("x86" if architecture == "amd64" else "arm64"), commands[5])
-                self.assertEqual(commands[-1][-2:], ["--architecture", architecture])
-                for command in commands:
-                    for forbidden in ("dpkg-buildpackage", "dpkg-deb", "dh_builddeb", "binary_", "binary-"):
-                        self.assertNotIn(forbidden, " ".join(command))
+                self.assertIn(f"manage-config {architecture} no_sign", commands[4][-1])
+                self.assertIn(f"debian/config.local/{architecture}/config.sonic-vs", commands[4][-1])
+                self.assertIn("bazel-debug-sources.patch", commands[3][-1])
+                self.assertIn("/usr/bin/dpkg-buildpackage -b -us -uc -Pnodoc -j4", commands[-1][-1])
+                self.assertNotIn("nokerneldbg", repr(commands))
         with self.assertRaisesRegex(ValueError, "unsupported kernel architecture"):
             action.compilation_commands("armhf")
+
+    def test_package_inventory_checks_real_debian_control_and_records_unexported_packages(self):
+        for architecture in action.ARCHITECTURES:
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in action.package_names(architecture):
+                    write_deb(root / name)
+                extra = root / f"linux-libc-dev_6.12.41-1_{architecture}.deb"
+                write_deb(extra)
+                records = action.created_package_records(root, architecture)
+                self.assertEqual(len(records), 6)
+                self.assertEqual({r["name"] for r in records if r["exported"]}, action.package_names(architecture))
+                self.assertEqual(next(r["kind"] for r in records if r["name"] == extra.name), "other")
+                write_deb(extra, architecture="all")
+                with self.assertRaisesRegex(ValueError, "filename differs from control"):
+                    action.created_package_records(root, architecture)
+                write_deb(extra, version="6.12.42-1")
+                with self.assertRaisesRegex(ValueError, "version or architecture"):
+                    action.created_package_records(root, architecture)
+                extra.unlink()
+                (root / sorted(action.package_names(architecture))[0]).unlink()
+                with self.assertRaisesRegex(ValueError, "omitted required"):
+                    action.created_package_records(root, architecture)
 
 
 if __name__ == "__main__":

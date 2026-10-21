@@ -26,7 +26,7 @@ jobs:
       - run: python3 tools/bazel/build_test.py
       - run: python3 tools/bazel/verify_cache_test.py
       - run: python3 tools/bazel/collect_ci_artifacts_test.py
-      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_arch.py tools/bazel/kernel_action.py tools/bazel/stage_kernel.py tools/bazel/verify_debug.py tools/bazel/verify_cache.py tools/bazel/collect_ci_artifacts.py
+      - run: python3 -m py_compile tools/bazel/build.py tools/bazel/kernel_arch.py tools/bazel/kernel_action.py tools/bazel/stage_kernel.py tools/bazel/verify_debug.py tools/bazel/verify_install.py tools/bazel/verify_cache.py tools/bazel/collect_ci_artifacts.py
 
   source-and-cache:
     name: ${{ matrix.name }} VS kernel source and remote cache
@@ -44,10 +44,6 @@ jobs:
             machine: aarch64
             runner: ubuntu-24.04-arm
     timeout-minutes: 300
-    # Temporary Draft-PR validation until registry #39 publishes the kernel tools.
-    # Remove this override and the selection step once that version is on main.
-    env:
-      SONIC_BAZEL_REGISTRY: https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-build-tools-current
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,7 +54,7 @@ jobs:
           test "$(uname -m)" = '${{ matrix.machine }}'
           test "$(dpkg --print-architecture)" = '${{ matrix.architecture }}'
           echo 'Native Linux ${{ matrix.name }} runner verified.'
-      - name: Prepare private consumers and select the temporary registry branch
+      - name: Prepare independent consumers using the canonical registry
         run: |
           python3 - <<'PY_REGISTRY'
           import os
@@ -72,7 +68,6 @@ jobs:
           original = (template / ".bazelrc").read_text()
           if [line for line in original.splitlines() if line.startswith(prefix)] != [prefix + "main"]:
               raise SystemExit("Expected one SONiC registry entry selecting main")
-          selected = original.replace(prefix + "main", "common --registry=" + os.environ["SONIC_BAZEL_REGISTRY"])
           for run in ("cold", "hit"):
               consumer = root / (run + "-consumer")
               consumer.mkdir()
@@ -81,7 +76,7 @@ jobs:
                   if not source.is_file() or source.is_symlink():
                       raise SystemExit("Expected regular consumer template files")
                   shutil.copyfile(source, consumer / name)
-              (consumer / ".bazelrc").write_text(selected)
+              (consumer / ".bazelrc").write_text(original)
           PY_REGISTRY
       - name: Allocate space on this disposable runner
         run: |
@@ -127,7 +122,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/kernel-private/cold" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
-            --target @sonic_linux_kernel//:kernel_artifacts \
+            --target @sonic_linux_kernel//:kernel_packages \
             --remote-cache http://127.0.0.1:8080 \
             --bazel-arg=--strategy=SonicKernelBuild=local \
             > "$RUNNER_TEMP/kernel-private/cold-launcher.log" 2>&1; then
@@ -157,7 +152,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/kernel-private/hit" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
-            --target @sonic_linux_kernel//:kernel_artifacts \
+            --target @sonic_linux_kernel//:kernel_packages \
             --remote-cache http://127.0.0.1:8080 --remote-cache-read-only \
             --bazel-arg=--strategy=SonicKernelBuild=local \
             > "$RUNNER_TEMP/kernel-private/hit-launcher.log" 2>&1; then
@@ -167,7 +162,7 @@ jobs:
             echo "Kernel cache consumer command failed with exit code $status."
             exit "$status"
           fi
-      - name: Verify compilation was skipped and TARs are identical
+      - name: Verify compilation was skipped and Debian packages are identical
         run: |
           umask 077
           if python3 tools/bazel/verify_cache.py \
@@ -181,7 +176,7 @@ jobs:
             echo "Kernel source and cache verification failed with exit code $status."
             exit "$status"
           fi
-      - name: Verify debugger lookup from the installed TARs
+      - name: Install packages and verify hooks, headers and debugger lookup
         run: |
           umask 077
           docker run --rm --platform=linux/${{ matrix.architecture }} \
@@ -190,17 +185,16 @@ jobs:
             debian:trixie-20260918@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c \
             /bin/sh -ec '
               apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gdb python3 binutils xz-utils zstd
-              mkdir /installed
-              tar -xf /evidence/verified/kernel-runtime.tar -C /installed
-              tar -xf /evidence/verified/kernel-debug.tar -C /installed
-              python3 /source/tools/bazel/verify_debug.py --architecture ${{ matrix.architecture }} --root /installed --output /evidence/debugger.json
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gdb python3 binutils xz-utils zstd build-essential kmod initramfs-tools
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /evidence/verified/*.deb
+              python3 /source/tools/bazel/verify_install.py --architecture ${{ matrix.architecture }} --output /evidence/installation.json
+              python3 /source/tools/bazel/verify_debug.py --architecture ${{ matrix.architecture }} --root / --output /evidence/debugger.json
             ' > "$RUNNER_TEMP/kernel-private/debugger.log" 2>&1
-          echo "Installed kernel/module debug and source lookup passed."
+          echo "Installed package metadata, initramfs, external-module build and debugger lookup passed."
       - name: Collect private cache service diagnostics
         if: always()
         run: docker logs sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache.log" 2>&1 || true
-      - name: Create public-safe TARs and evidence
+      - name: Create public-safe Debian packages and evidence
         id: collect
         if: always()
         env:
@@ -210,7 +204,7 @@ jobs:
             --architecture '${{ matrix.architecture }}' \
             --private-root "$RUNNER_TEMP/kernel-private" --source-root "$GITHUB_WORKSPACE" \
             --output "$RUNNER_TEMP/kernel-artifacts" --job-status "$KERNEL_JOB_STATUS"
-      - name: Retain TARs and allowlisted cache evidence
+      - name: Retain Debian packages and allowlisted cache evidence
         if: always() && steps.collect.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -36,7 +36,7 @@ if not locations or not locations[0].symtab or locations[0].line < 1:
 location = locations[0]
 source = pathlib.Path(location.symtab.fullname()).resolve()
 if not source.is_relative_to(source_root) or not source.is_file():
-    raise RuntimeError("GDB source is absent from the debug TAR")
+    raise RuntimeError("GDB source is absent from the debug Debian package")
 if len(source.read_text().splitlines()) < location.line:
     raise RuntimeError("GDB source line is outside the shipped file")
 gdb.execute("list " + name, to_string=True)
@@ -92,7 +92,7 @@ def verify(root, architecture="amd64"):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True, help="root with extracted matching runtime/debug TARs")
+    parser.add_argument("--root", type=Path, required=True, help="root with extracted matching runtime/debug Debian packages")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="amd64")
     args = parser.parse_args()

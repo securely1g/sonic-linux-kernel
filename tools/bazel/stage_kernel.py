@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage Debian's compiled kernel outputs as installed runtime/debug TARs.
+"""Add matched debug sources and build-ID links to Debian's debug package.
 
 Debian build_image already separates signed stripped modules from their original
 unsigned debug ELFs. Preserve those bytes: changing a signed module to add a GNU
@@ -13,21 +13,13 @@ import json
 import lzma
 import os
 from pathlib import Path
-import posixpath
 import re
 import shutil
 import subprocess
 import tempfile
 
-from kernel_arch import (ABINAME, ARCHITECTURES, build_directory, elf_machine,
+from kernel_arch import (ARCHITECTURES, build_directory, elf_machine,
                          kernel_abi, kernel_architecture, materialize_kernel_elf)
-
-# Keep the old constants available to AMD64 callers.
-ABI = kernel_abi()
-EPOCH = 1754969284
-COMMON_HEADERS = "linux-headers-" + ABINAME + "-common-sonic"
-ARCH_HEADERS = "linux-headers-" + ABI
-KBUILD = "linux-kbuild-" + ABINAME
 
 
 def require(condition, message):
@@ -80,7 +72,9 @@ def validate_debug_pairs(source, runtime, debug, architecture="amd64"):
         materialize_kernel_elf(architecture, source, runtime / ("boot/vmlinuz-" + abi), kernel, embedded)
         require(elf_info(embedded, architecture)[0] == kernel_id, "boot image and debug vmlinux build IDs differ")
         build_id_link(debug, kernel, kernel_id)
-        modules = runtime / "usr/lib/modules" / abi
+        modules = runtime / "lib/modules" / abi
+        if not modules.exists():
+            modules = runtime / "usr/lib/modules" / abi
         debug_modules = debug / "usr/lib/debug/lib/modules" / abi
         runtime_modules = sorted(list(modules.rglob("*.ko")) + list(modules.rglob("*.ko.xz")))
         require(runtime_modules, "runtime contains no kernel modules")
@@ -112,137 +106,34 @@ def validate_debug_pairs(source, runtime, debug, architecture="amd64"):
             "module_build_ids_sha256": hashlib.sha256(json.dumps(pairs, sort_keys=True).encode()).hexdigest()}
 
 
-def stage_headers(source, build, development, architecture="amd64"):
-    """Preserve the header layout documented in Debian rules.real.
+def stage(source, debug, artifacts, architecture="amd64"):
+    """Run inside Debian binary_image-dbg before its maintained dh_* sequence.
 
-    Copying these installation inputs is independent of Debian's binary_headers
-    targets, which would also assemble packages. Kbuild tools are installed by
-    stage-kernel.mk using Debian's own install recipes.
+    Debian owns the control metadata, dependencies, hooks, runtime, headers and
+    kbuild packaging. This hook only adds matching source and build-ID links to
+    the already staged debug package; it never repacks or modifies signed ELFs.
     """
     abi = kernel_abi(architecture)
-    kernel_arch = kernel_architecture(architecture)
-    arch_headers = "linux-headers-" + abi
-    common = development / "usr/src" / COMMON_HEADERS
-    arch = development / "usr/src" / arch_headers
-    copy(source / "Makefile", common / "Makefile")
-    copy(source / "include", common / "include")
-    # Debian's common-headers contract includes shared headers for every arch.
-    for arch_source in sorted((source / "arch").iterdir()):
-        if not arch_source.is_dir():
-            continue
-        selected = set(arch_source.glob("Makefile*"))
-        selected.update(p for p in arch_source.rglob("*") if p.name in ("Kbuild.platforms", "Platform"))
-        directories = [p for p in arch_source.rglob("*") if p.is_dir() and p.name in ("include", "scripts")]
-        for path in directories + sorted(selected):
-            copy(path, common / path.relative_to(source))
-    for name in (".config", "Module.symvers", "include"):
-        copy(build / name, arch / name)
-    for path in build.glob(".kernel*"):
-        copy(path, arch / path.name)
-    copy(build / "arch" / kernel_arch / "include", arch / "arch" / kernel_arch / "include")
-    (arch / "arch" / kernel_arch / "kernel").mkdir(parents=True, exist_ok=True)
-    copy(build / "scripts/module.lds", arch / "arch" / kernel_arch / "module.lds")
-    for path in arch.rglob("*.cmd"):
-        path.unlink()
-    subprocess.run(["/usr/bin/objcopy", "-j", ".BTF", "-j", ".BTF_ids",
-                    str(build / "vmlinux"), str(arch / "vmlinux")], check=True)
-    (arch / "vmlinux").chmod(0o644)
-    (arch / "Makefile").write_text("include /usr/src/" + COMMON_HEADERS + "/Makefile\n")
-    for directory in (common, arch):
-        for name in ("scripts", "tools"):
-            link(os.path.relpath(development / "usr/lib" / KBUILD / name, directory), directory / name)
-    link("../lib/" + KBUILD, development / "usr/src" / KBUILD)
-    for name, target in (("build", arch_headers), ("source", COMMON_HEADERS)):
-        destination = development / "usr/lib/modules" / abi / name
-        link(os.path.relpath(development / "usr/src" / target, destination.parent), destination)
-    require((development / "usr/lib" / KBUILD / "scripts/mod/modpost").is_file(),
-            "development TAR omitted the installed kbuild module tools")
-
-
-def write_tar(root, output):
-    """Use the declared GNU tar with canonical installed-file metadata."""
-    names = []
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        require(path.is_file() or path.is_dir() or path.is_symlink(), "unsupported staged file type")
-        if path.is_symlink():
-            target = os.readlink(path)
-            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
-            require(not target.startswith("/") and not resolved.startswith("../") and resolved != "..",
-                    "TAR link escapes installation root or names a build-tree path")
-        else:
-            path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644)
-        names.append(relative)
-    subprocess.run([
-        "/usr/bin/tar", "--create", "--file=" + str(output.resolve()), "--format=posix",
-        "--pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime",
-        "--mtime=@" + str(EPOCH), "--owner=0", "--group=0", "--numeric-owner",
-        "--hard-dereference", "--no-recursion", "--null", "--files-from=-",
-    ], cwd=root, input=("\0".join(names) + "\0").encode(), check=True)
-
-
-def stage(source, staging, artifacts, architecture="amd64"):
-    abi = kernel_abi(architecture)
-    kernel_arch = kernel_architecture(architecture)
-    arch_headers = "linux-headers-" + abi
     build = source / "debian/build" / build_directory(architecture)
     patched = source / "debian/build/source_sonic"
-    runtime, debug, development = (staging / name for name in ("runtime", "debug", "development"))
-    for path in (runtime, debug, development, artifacts):
-        path.mkdir(parents=True, exist_ok=True)
-    image, symbols = build / "output/image", build / "output/image-dbg"
-    copy(image / "boot", runtime / "boot")
-    copy(image / "lib/modules", runtime / "usr/lib/modules")
-    if architecture == "arm64":
-        # Debian's build_image installs native ARM64 device trees separately
-        # from /boot and /lib/modules. Retain their installed ABI directory.
-        device_trees = image / "usr/lib" / ("linux-image-" + abi)
-        require(sorted((image / "usr/lib").glob("linux-image-*")) == [device_trees]
-                and device_trees.is_dir() and not device_trees.is_symlink(),
-                "ARM64 device trees are missing or belong to another ABI")
-        copy(device_trees, runtime / device_trees.relative_to(image))
-    # Preserve the real map, and match Debian's config filtering of ephemeral keys.
-    copy(build / "System.map", runtime / ("boot/System.map-" + abi))
-    config = (build / ".config").read_text().splitlines(keepends=True)
-    (runtime / ("boot/config-" + abi)).write_text("".join(line for line in config if not re.search(
-        r"CONFIG_(MODULE_SIG_(ALL|KEY)|SYSTEM_TRUSTED_KEYS|BUILD_SALT)[ =]", line)))
-    copy(symbols / "boot", debug / "usr/lib/debug/boot")
-    copy(symbols / "lib/modules", debug / "usr/lib/debug/lib/modules")
-    if (symbols / "usr/lib/debug").exists():
-        copy(symbols / "usr/lib/debug", debug / "usr/lib/debug")
-    link("boot/vmlinux-" + abi, debug / ("usr/lib/debug/vmlinux-" + abi))
-    link("../../../boot/vmlinux-" + abi, debug / "usr/lib/debug/lib/modules" / abi / "vmlinux")
-    for tree in (runtime / "usr/lib/modules" / abi, debug / "usr/lib/debug/lib/modules" / abi):
-        require(not (tree / "build").exists() and not (tree / "build").is_symlink()
-                and not (tree / "source").exists() and not (tree / "source").is_symlink(),
-                "runtime/debug contains an unintended header or build-tree link")
-    stage_headers(patched, build, development, architecture)
-    # DWARF paths retain Debian's relative build layout after debug-prefix-map.
-    # Ship the actual patched source and generated headers so source/line lookup
-    # also works when the disposable compiler tree has been removed.
+    require((debug / ("usr/lib/debug/boot/vmlinux-" + abi)).is_file(),
+            "Debian has not staged the debug kernel")
     debug_source = debug / "usr/src/debug" / ("linux-" + abi)
     shutil.copytree(patched, debug_source / "debian/build/source_sonic",
                     symlinks=True, ignore=shutil.ignore_patterns(".pc"))
-    for name in ("include", "arch/" + kernel_arch + "/include", ".config"):
+    for name in ("include", "arch/" + kernel_architecture(architecture) + "/include", ".config"):
         copy(build / name, debug_source / "debian/build" / build_directory(architecture) / name)
-    for tree, packages in ((runtime, ["linux-image-" + abi + "-unsigned"]),
-                           (debug, ["linux-image-" + abi + "-dbg"]),
-                           (development, [COMMON_HEADERS, arch_headers, KBUILD])):
-        for package in packages:
-            for name in ("copyright", "changelog"):
-                copy(source / "debian" / name, tree / "usr/share/doc" / package / name)
-    receipt = validate_debug_pairs(source, runtime, debug, architecture)
+    receipt = validate_debug_pairs(source, build / "output/image", debug, architecture)
+    artifacts.mkdir(parents=True, exist_ok=True)
     (artifacts / "debug-validation.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    for name, tree in (("runtime", runtime), ("debug", debug), ("development", development)):
-        write_tar(tree, artifacts / ("kernel-" + name + ".tar"))
     print("SONIC_KERNEL_DEBUG_VERIFIED " + json.dumps(receipt, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
-    parser.add_argument("staging", type=Path)
+    parser.add_argument("debug", type=Path)
     parser.add_argument("artifacts", type=Path)
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="amd64")
     args = parser.parse_args()
-    stage(args.source, args.staging, args.artifacts, args.architecture)
+    stage(args.source, args.debug, args.artifacts, args.architecture)

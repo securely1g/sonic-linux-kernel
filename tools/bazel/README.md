@@ -1,181 +1,109 @@
-# Cached kernel source builds
+# Bazel kernel packages and shared action cache
 
-`//:kernel_artifacts` compiles the maintained SONiC/Debian kernel and exports
-three filesystem layers with one provenance manifest:
+`//:kernel_packages` compiles the maintained SONiC/Debian kernel source and exports
+five real Debian packages. `//:kernel_artifacts` remains an aggregate alias.
 
-| Target | Artifact | Installed content |
+| Target | Packages | Purpose |
 | --- | --- | --- |
-| `//:runtime_tar` | `kernel-runtime.tar` | `/boot/vmlinuz-*`, config, real System.map, signed modules under `/usr/lib/modules/<ABI>`, and ARM64 device trees under `/usr/lib/linux-image-<ABI>` |
-| `//:debug_tar` | `kernel-debug.tar` | Matching unstripped vmlinux/modules, GNU build-ID links, patched sources and generated headers |
-| `//:development_tar` | `kernel-development.tar` | Configured common/native headers, Module.symvers, BTF, kbuild programs, and relative build/source links |
-| `//:manifest` | `kernel-artifacts.json` | Schema 2: source/tool identities, TAR kinds/hashes/sizes, and verified debug pairing |
+| `//:runtime_deb` | `linux-image-<ABI>-unsigned` | Kernel image, config, modules, native device trees and maintained postinst hooks |
+| `//:debug_deb` | `linux-image-<ABI>-dbg` | Matched vmlinux/module symbols, GNU build-ID links, patched sources and generated headers |
+| `//:development_debs` | `linux-headers-<ABI>`, `linux-headers-6.12.41+deb13-common-sonic`, `linux-kbuild-6.12.41+deb13` | Configured headers, Module.symvers, BTF and native module build tools |
+| `//:manifest` | `kernel-packages.json` | Schema3 package identity/size/hash, source/tool provenance, all created packages, and debug pairing |
 
-Supported configurations are Debian Trixie, native AMD64 or native ARM64 execution
-and target, VS, kernel `6.12.41-1`, and an unsigned boot image. The ABI is
-`6.12.41+deb13-sonic-amd64` or `6.12.41+deb13-sonic-arm64`.
-`kernel_artifacts` selects the matching native target; output directories include
-the architecture while preserving the TAR basenames.
-Cross-compilation, other architectures, external patches and secure-upgrade signing
-remain on the existing Make path.
+The supported configurations are native Linux AMD64 and ARM64, VS, kernel version
+`6.12.41-1`, and an unsigned boot image. The ABI is
+`6.12.41+deb13-sonic-amd64` or `6.12.41+deb13-sonic-arm64`. Package filenames follow
+`<package>_6.12.41-1_<architecture>.deb`; common headers use architecture `all`.
+Bazel execution and target constraints must match. This is not cross compilation.
 
-## Source, configuration and installation
+The kernel action uses checksum-pinned source archives, the repository's SONiC
+patches/configuration, and the declared `sonic-build-tools` tool tree. It runs
+`dpkg-buildpackage -b -us -uc -Pnodoc -j4`, the same maintained Debian binary recipe
+used by the normal Make build, offline in a disposable chroot. Debian owns the
+control metadata, dependencies, maintainer scripts, image, headers and kbuild
+installation layouts. The existing Make contract is unchanged.
 
-Bazel declares the checksum-verified Debian source archives, SONiC patches and
-configuration, source preparation/staging programs, and the complete shared
-`sonic-build-infra` execution tool runtime. The action copies these tools into
-private scratch space and runs inside a chroot at a fixed `/build` path with a
-fixed locale and source timestamp. Compilation makes no source downloads.
+A Bazel-only patch adds a staging hook to Debian's `binary_image-dbg` recipe before
+its maintained debhelper packaging sequence. It includes the actual patched
+sources/generated headers under `/usr/src/debug/linux-<ABI>` and adds GNU build-ID
+links. It verifies the boot image against debug vmlinux and every signed, stripped
+runtime module against its original unsigned debug module. ARM64 raw Image bytes
+must match reconstruction from the same debug vmlinux. No signed module is
+modified to add a debuglink. Debian's debug package retains the real System.map;
+the image package keeps Debian's normal System.map notice.
 
-Source extraction still uses `dpkg-source`, then the SONiC config/patch overlay,
-`manage-config`, and Debian's generated rules. Only
-`build-arch_<arch>_sonic_<arch>_image` and `build-arch_<arch>_kbuild` are selected,
-where `<arch>` is `amd64` or `arm64`.
-Debian's `build_image` already stages the boot image, stripped signed modules,
-and original unsigned debug ELFs. `stage-kernel.mk` reuses Debian's kbuild
-**install** recipes; `stage_kernel.py` preserves Debian's configured header
-layout and writes the three TARs using the declared GNU tar.
+The manifest's `packages` inventory contains the five exported DEBs, including
+Debian Package/Version/Architecture fields, kinds, hashes and sizes.
+`created_packages` records every DEB produced by the Debian recipe before cleanup,
+including whether it was exported. Metadata is read from actual packages with
+`dpkg-deb`. Additional generated packages remain private to the action.
 
-The Bazel path never invokes `dpkg-buildpackage`, binary-package targets,
-`dh_builddeb`, or DEB assembly. It fails if a binary Debian package appears in
-the private source output. Fetched Debian build-tool packages are declared
-execution inputs; this does not turn the kernel into a prebuilt runtime.
-The standalone Make DEB path remains available for configurations outside this
-migration.
+## Local build and cache reuse
 
-Runtime and development layers retain the Debian source copyright/changelog.
-Development headers include `.config`, `.kernel*`, Module.symvers, generated
-includes, BTF-only vmlinux, module.lds, and installed kbuild scripts/tools. The
-relative `/usr/lib/modules/<ABI>/{build,source}` links are in the development
-layer; runtime/debug archives contain no links into the disposable build tree.
-
-## Debug symbols and sources
-
-Debian builds with its existing optimized configuration and
-`CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y`. The action requires DWARF in the
-original vmlinux and every debug module, compares every GNU build ID to its
-stripped runtime counterpart, and checks that runtime module signatures remain
-intact. On AMD64 it extracts the ELF embedded in the boot image and compares its
-build ID with the packaged vmlinux. ARM64 boots a raw `Image`; the check recreates
-that image from the same debug vmlinux using the pinned Kbuild objcopy recipe and
-requires identical bytes.
-
-Do not add a `.gnu_debuglink` after signing a module: changing its bytes would
-invalidate the signature. The debug TAR instead supplies matching GNU build-ID
-links and conventional `/usr/lib/debug` locations. It also ships the patched
-kernel source and generated headers under `/usr/src/debug/linux-<ABI>`, retaining
-the relative Debian build layout recorded by `-fdebug-prefix-map`.
-
-CI extracts only the runtime/debug TARs into a new root and runs:
-
-```sh
-python3 tools/bazel/verify_debug.py --architecture amd64 --root /installed --output debugger.json
-```
-
-This check requires GDB to load the packaged build-ID symbols, resolve actual
-shipped source lines for `start_kernel` and a representative module, and inspect
-`struct task_struct`. The compiler tree is unavailable. GDB runs in a separate
-native validation container; its version and architecture are recorded in the
-public validation summary. Use `--architecture arm64` for ARM64 artifacts.
-For ARM64 kernel symbol lookup, the verifier uses a stripped ELF probe derived
-from the vmlinux that matched the raw boot image; that probe is not a deployed
-boot artifact. Module lookup uses the actual runtime module on both architectures.
-
-The Debian build generates a temporary module-signing key and removes its
-private key after installation. Independent cold builds are therefore not
-claimed to be byte-identical. A cache hit returns the exact TARs from its trusted
-producer.
-
-## Buildimage handoff
-
-A TAR is an installed filesystem payload, with no package-manager records or
-maintainer scripts. Consumers must explicitly run `depmod`, create/update the
-ABI-specific initramfs after SONiC hooks, and install development tools before
-building out-of-tree modules. The debug TAR belongs in the debug image/layer.
-No adapter should fabricate dpkg state or convert these TARs back into DEBs.
-
-Compilation remains one coarse Bazel action. An unchanged action can reuse all
-three layers; a source/config/tool change rebuilds the kernel. Selecting only
-one output layer still executes that same kernel action on a miss. This supports
-remote **caching** with local execution, not remote execution of the chroot.
-
-## Registry selection
-
-Local builds and normal CI use `sonic-bazel-registry/main` plus Bazel Central
-Registry. This Draft PR still needs the kernel execution tools in
-[registry #39](https://github.com/securely1g/sonic-bazel-registry/pull/39).
-Its ARM64 tool runtime includes the ARM32 compatibility-vDSO compiler from
-[build-infra #52](https://github.com/securely1g/sonic-build-infra/pull/52).
-Until that entry lands, source/cache CI explicitly replaces the single SONiC
-endpoint in private consumer copies with `codex/kernel-build-tools-current`.
-It does not add a fallback registry or pin a registry commit. Local review builds
-must select that branch in their private consumer `.bazelrc` as well. Remove the
-temporary override when the exact dependency lands on main.
-
-## Run locally and verify cache reuse
-
-The launcher needs native Linux AMD64 or ARM64 and Docker. It selects the matching
-checksum-pinned Bazel binary, Docker image platform and Bazel execution/target
-platforms. `--architecture amd64` or `--architecture arm64` can assert the native
-host architecture; a mismatched host is rejected. Root runs only inside its disposable
-pinned Debian container, with Docker's normal `SYS_CHROOT`/`MKNOD` capabilities;
-there is no privileged mode or mounted Docker socket. The launcher installs
-`xz-utils` only to bootstrap APT repository-index decompression. Kernel compiler,
-Make, archive and installation tools come from the declared runtime. The worker
-network permits repository fetching/cache traffic; the chroot uses supplied
-archives but is not a separate network namespace.
+Use Docker on a native Linux AMD64 or ARM64 host. The launcher selects a pinned
+Bazel8.5.1 executable, worker image and matching Bazel platform. Sources and tools
+are fetched by Bazel; the kernel action itself has no network access. Registry
+resolution uses the canonical SONiC registry `main` plus the Bazel Central Registry.
 
 ```sh
 python3 tools/bazel/build.py \
-  --workspace tools/bazel/cache-consumer \
-  --work-dir /tmp/my-kernel-build \
-  --module-override "sonic-linux-kernel=$PWD" \
-  --target @sonic_linux_kernel//:kernel_artifacts \
+  --architecture amd64 \
+  --work-dir /tmp/kernel-cold \
+  --repository-cache /tmp/kernel-downloads \
   --remote-cache http://127.0.0.1:8080
 ```
 
-The same launcher command works on either native architecture. Direct Bazel
-commands on an ARM64 host use `--config=arm64` with the root `.bazelrc`; the
-default direct-Bazel configuration remains AMD64.
+Use `--architecture arm64` on a native ARM64 host. `--remote-cache` accepts the
+shared HTTP cache URL for the deployment. A trusted cache can serve both
+architectures; their source/configuration/tool/action identities differ.
+`--disk-cache /path/to/persistent/cache` optionally retains a local Bazel cache.
+A matching cache hit returns the original DEB bytes without compiling the kernel.
+Independent cold builds may differ because Debian generates module-signing keys.
 
-The own-source override validates the proposed component. Buildimage's registered
-consumer selects the published source snapshot; rerun that graph after source
-and registry updates. Keep dependency versions aligned between consumers.
-
-To prove remote reuse, build with an empty trusted remote cache, then use a
-second private consumer and fresh `--work-dir`, `--remote-cache-read-only`, and
-no disk cache. Run:
+To prove remote reuse, start an empty loopback Bazel remote cache, build from one
+consumer, then use a fresh output directory and read-only cache consumer. Do not
+configure a disk cache for this proof:
 
 ```sh
+python3 tools/bazel/build.py \
+  --architecture amd64 --work-dir /tmp/kernel-hit \
+  --repository-cache /tmp/kernel-downloads \
+  --remote-cache http://127.0.0.1:8080 --remote-cache-read-only
 python3 tools/bazel/verify_cache.py \
-  --architecture amd64 \
-  --cold /tmp/my-kernel-build --hit /tmp/my-kernel-cache-hit \
-  --artifacts /tmp/my-kernel-evidence
+  --architecture amd64 --cold /tmp/kernel-cold --hit /tmp/kernel-hit \
+  --artifacts /tmp/kernel-verified
 ```
 
-The verifier requires real cold execution and a `remote cache hit` for the
-second kernel action, identical declared action inputs, and identical hashes
-for all three TARs and the manifest. Timing alone does not establish a hit.
-Use `--architecture arm64` for ARM64 verification. Invocations, manifest ABI,
-tool identity, TAR layout and debugger results must match the expected architecture.
-Without a remote service, omit that option; `--repository-cache` only reuses
-verified downloads, while an optional `--disk-cache` stores local action results.
-Never put credentials in the recorded remote-cache URL.
+`verify_cache.py` requires one successful local `SonicKernelBuild` action followed
+by a `remote cache hit` with identical command/environment/platform/input/output
+identities and byte-identical five DEBs plus manifest. Timing alone is insufficient.
 
-## CI evidence
+Consumers should install the DEBs through apt/dpkg, retaining package records,
+dependencies, initramfs hooks and future package upgrades. The debug DEB can be
+installed only in a debug image; header and kbuild DEBs belong in module build
+environments. Buildimage uses the four original Make packages for its ordinary
+kernel/module flow and consumes the debug package when requested.
 
-The matrix uses `ubuntu-24.04` for AMD64 and native `ubuntu-24.04-arm` for ARM64.
-Each job checks its native machine/userspace architecture, compiles into an empty
-remote cache, and verifies a fresh read-only consumer with its disk cache disabled.
-Checks and artifact names distinguish the two architectures.
+## Native CI and publication boundary
 
-Source/cache CI retains three verified TARs, `kernel-artifacts.json`,
-`validation.json`, and `resolution.json`. The collector validates the complete
-manifest, source/tool identity, safe filesystem TAR contents, matching module
-inventories, GDB results, and producer/cache-consumer hashes before publication.
-Source inputs and registry/module resolution must agree between both builds.
+CI builds from source independently on `ubuntu-24.04` AMD64 and
+`ubuntu-24.04-arm` ARM64, then proves a fresh read-only remote-cache hit. A fresh
+native Trixie container installs all five DEBs with apt, verifies dpkg package
+identities/configuration, verifies the postinst-generated ABI initramfs, compiles
+an external module using installed headers/kbuild, and checks its native ELF
+architecture and vermagic. GDB then verifies installed build-ID symbol selection,
+`start_kernel` and representative module source lines, and `struct task_struct`
+without access to the compiler tree or debuginfod.
 
-Raw logs, execution records, BEP, profiles, generated locks, cache diagnostics
-and arbitrary environment values remain in private job scratch. The public
-resolution summary is an allowlisted module/registry record, not a reusable
-lockfile. On an earlier failure, only a bounded status summary is published.
-The focused Python tests use harmless TAR fixtures and do not create DEBs.
+Successful CI publishes only five DEBs, `kernel-packages.json`, `validation.json`
+and `resolution.json`. A strict collector validates the exact package and manifest
+contracts, filesystem payload paths, source/tool identity, native architecture,
+cache proof, installation and debugger receipts before copying files. Failed jobs
+publish only a fixed incomplete-validation summary. Raw execution logs, profiles,
+module lockfile extension state, environment values and cache diagnostics remain
+private. Public artifacts expire after seven days.
+
+The five source-owned regression-test targets cover input identity, actual Debian
+control fixtures, cache provenance, debug pairing, launcher architecture and the
+public artifact allowlist. Registry CI runs these contracts on both architectures;
+the source repository owns the full native kernel builds.

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Focused regressions for signed kernel runtime/debug payloads."""
 import hashlib
-import io
 import lzma
 from pathlib import Path
-import tarfile
 import tempfile
 import sys
 import unittest
@@ -17,33 +15,6 @@ import verify_debug
 
 
 class StageKernelTest(unittest.TestCase):
-    def test_tar_preserves_installed_links_and_canonical_metadata(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            tree = root / "tree"
-            (tree / "usr/src/headers").mkdir(parents=True)
-            (tree / "usr/src/headers/Makefile").write_text("header source")
-            stage.link("../../../src/headers", tree / "usr/lib/modules/test/build")
-            stage.write_tar(tree, root / "one.tar")
-            (tree / "usr/src/headers/Makefile").touch()
-            stage.write_tar(tree, root / "two.tar")
-            self.assertEqual((root / "one.tar").read_bytes(), (root / "two.tar").read_bytes())
-            with tarfile.open(root / "one.tar") as archive:
-                self.assertEqual(archive.getmember("usr/lib/modules/test/build").linkname, "../../../src/headers")
-                for item in archive.getmembers():
-                    self.assertEqual((item.uid, item.gid, item.mtime), (0, 0, stage.EPOCH))
-                    self.assertFalse(item.islnk())
-
-    def test_tar_rejects_build_tree_and_parent_escape_links(self):
-        for target in ("/build/source/tree", "../../../../escape"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                tree = root / "tree"
-                tree.mkdir()
-                (tree / "link").symlink_to(target)
-                with self.assertRaisesRegex(ValueError, "build-tree|escapes"):
-                    stage.write_tar(tree, root / "output.tar")
-
     def test_signed_runtime_keeps_bytes_and_pairs_original_debug_by_build_id(self):
         for architecture in kernel_arch.ARCHITECTURES:
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
@@ -121,68 +92,35 @@ class StageKernelTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "kernel artifact"):
                     stage.elf_info(Path("fixture"), other)
 
-    def test_arm64_development_headers_use_arm64_layout_and_module_links(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source, build, development = root / "source", root / "build", root / "development"
-            for relative in ("Makefile", "include/linux/types.h", "arch/arm64/include/asm/types.h"):
-                path = source / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("source header")
-            for relative in (".config", "Module.symvers", "include/generated/test.h", "arch/arm64/include/generated/test.h", "scripts/module.lds", "vmlinux"):
-                path = build / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("generated header")
-            modpost = development / "usr/lib" / stage.KBUILD / "scripts/mod/modpost"
-            modpost.parent.mkdir(parents=True)
-            modpost.write_bytes(b"installed tool")
-            with patch.object(stage.subprocess, "run", side_effect=lambda command, **kwargs: Path(command[-1]).write_bytes(b"BTF")):
-                stage.stage_headers(source, build, development, "arm64")
-            abi = kernel_arch.kernel_abi("arm64")
-            headers = development / "usr/src" / ("linux-headers-" + abi)
-            self.assertTrue((headers / "arch/arm64/include/generated/test.h").is_file())
-            self.assertTrue((headers / "arch/arm64/module.lds").is_file())
-            self.assertTrue((headers / "arch/arm64/kernel").is_dir())
-            self.assertFalse((headers / "arch/x86").exists())
-            self.assertEqual((development / "usr/lib/modules" / abi / "build").resolve(), headers)
-            self.assertEqual((development / "usr/lib/modules" / abi / "source").resolve(), development / "usr/src" / stage.COMMON_HEADERS)
-
-    def test_arm64_runtime_tar_preserves_installed_device_trees_for_its_abi(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            abi = kernel_arch.kernel_abi("arm64")
-            build = source / "debian/build" / kernel_arch.build_directory("arm64")
-            for relative in (
-                "output/image/boot/vmlinuz-" + abi,
-                "output/image/lib/modules/" + abi + "/kernel/dummy.ko",
-                "output/image-dbg/boot/vmlinux-" + abi,
-                "output/image-dbg/lib/modules/" + abi + "/kernel/dummy.ko",
-                "System.map", ".config",
-            ):
-                path = build / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"fixture")
-            for relative in ("debian/build/source_sonic/Makefile", "debian/copyright", "debian/changelog"):
-                path = source / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("fixture")
-            for relative in ("include", "arch/arm64/include"):
-                (build / relative).mkdir(parents=True)
-            installed = build / "output/image/usr/lib" / ("linux-image-" + abi)
-            device_tree = installed / "marvell/armada-7040-db.dtb"
-            device_tree.parent.mkdir(parents=True)
-            payload = b"\xd0\x0d\xfe\xed" + b"installed ARM64 device tree"
-            device_tree.write_bytes(payload)
-            with patch.object(stage, "stage_headers"), patch.object(stage, "validate_debug_pairs", return_value={}):
-                stage.stage(source, root / "stage", root / "artifacts", "arm64")
-            with tarfile.open(root / "artifacts/kernel-runtime.tar") as archive:
-                name = "usr/lib/linux-image-" + abi + "/marvell/armada-7040-db.dtb"
-                self.assertEqual(archive.extractfile(name).read(), payload)
-                self.assertFalse(any("sonic-amd64" in item.name for item in archive))
-            installed.rename(installed.with_name("linux-image-" + kernel_arch.kernel_abi("amd64")))
-            with self.assertRaisesRegex(ValueError, "device trees.*another ABI"):
-                stage.stage(source, root / "wrong-abi-stage", root / "wrong-abi-artifacts", "arm64")
+    def test_debug_package_adds_patched_sources_and_generated_native_headers(self):
+        for architecture in kernel_arch.ARCHITECTURES:
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, debug = root / "source", root / "debug-package"
+                abi = kernel_arch.kernel_abi(architecture)
+                build = source / "debian/build" / kernel_arch.build_directory(architecture)
+                kernel_architecture = kernel_arch.kernel_architecture(architecture)
+                for relative in ("include/generated/test.h", "arch/" + kernel_architecture + "/include/generated/test.h", ".config"):
+                    path = build / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("generated for " + architecture)
+                patched = source / "debian/build/source_sonic/init/main.c"
+                patched.parent.mkdir(parents=True)
+                patched.write_text("patched kernel source")
+                symbols = debug / ("usr/lib/debug/boot/vmlinux-" + abi)
+                symbols.parent.mkdir(parents=True)
+                symbols.write_bytes(b"original Debian debug ELF")
+                receipt = {"kernel_build_id": "ab" * 20, "module_count": 1, "module_build_ids_sha256": "cd" * 32}
+                with patch.object(stage, "validate_debug_pairs", return_value=receipt) as validate:
+                    stage.stage(source, debug, root / "artifacts", architecture)
+                    self.assertEqual(validate.call_args.args, (source, build / "output/image", debug, architecture))
+                installed = debug / "usr/src/debug" / ("linux-" + abi)
+                self.assertEqual((installed / "debian/build/source_sonic/init/main.c").read_text(), patched.read_text())
+                self.assertTrue((installed / "debian/build" / build.name / "arch" / kernel_architecture / "include/generated/test.h").is_file())
+                self.assertEqual(symbols.read_bytes(), b"original Debian debug ELF")
+                symbols.unlink()
+                with self.assertRaisesRegex(ValueError, "has not staged"):
+                    stage.stage(source, debug, root / "other-artifacts", architecture)
 
     def test_arm64_debugger_verifies_matching_kernel_and_module_paths(self):
         with tempfile.TemporaryDirectory() as temporary:

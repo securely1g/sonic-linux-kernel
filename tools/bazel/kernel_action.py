@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile and stage kernel TARs offline in a verified shared worker."""
+"""Build maintained Debian kernel packages offline in a verified shared worker."""
 
 import hashlib
 import json
@@ -12,17 +12,31 @@ import sys
 import stat
 import tempfile
 
-from kernel_arch import ARCHITECTURES, kernel_abi, kernel_architecture, validate_architecture
+from kernel_arch import ARCHITECTURES, kernel_abi, validate_architecture
 
 SOURCE_DATE_EPOCH = 1754969284  # Debian linux 6.12.41-1 changelog timestamp.
-ARTIFACT_KINDS = {
-    "kernel-runtime.tar": "runtime",
-    "kernel-debug.tar": "debug",
-    "kernel-development.tar": "development",
-}
-ARTIFACT_NAMES = set(ARTIFACT_KINDS)
-EXTRA_SOURCES = ("tools/bazel/kernel_arch.py", "tools/bazel/stage_kernel.py", "tools/bazel/stage-kernel.mk")
+MANIFEST = "kernel-packages.json"
+PACKAGE_VERSION = "6.12.41-1"
+EXTRA_SOURCES = ("tools/bazel/kernel_arch.py", "tools/bazel/stage_kernel.py")
 
+
+def package_kinds(architecture="amd64"):
+    abi = kernel_abi(architecture)
+    suffix = "_" + PACKAGE_VERSION + "_" + architecture + ".deb"
+    return {
+        "linux-image-" + abi + "-unsigned" + suffix: "runtime",
+        "linux-image-" + abi + "-dbg" + suffix: "debug",
+        "linux-headers-" + abi + suffix: "headers",
+        "linux-headers-6.12.41+deb13-common-sonic_" + PACKAGE_VERSION + "_all.deb": "headers_common",
+        "linux-kbuild-6.12.41+deb13" + suffix: "kbuild",
+    }
+
+
+def package_names(architecture="amd64"):
+    return set(package_kinds(architecture))
+
+
+PACKAGE_NAMES = package_names()
 
 
 def require(condition, message):
@@ -103,42 +117,57 @@ def checkout_source_identity(checkout):
 
 
 def validate_outputs(config):
-    validate_architecture(config.get("architecture", "amd64"))
+    names = package_names(config.get("architecture", "amd64"))
     outputs = config.get("outputs")
-    require(isinstance(outputs, list) and len(outputs) == len(ARTIFACT_NAMES)
+    require(isinstance(outputs, list) and len(outputs) == len(names)
             and all(isinstance(name, str) and name for name in outputs)
-            and {Path(name).name for name in outputs} == ARTIFACT_NAMES,
-            "kernel action must declare exactly runtime, debug and development TARs")
+            and {Path(name).name for name in outputs} == names,
+            "kernel action must declare exactly five Debian kernel packages")
     require(isinstance(config.get("manifest"), str)
-            and Path(config["manifest"]).name == "kernel-artifacts.json",
-            "kernel action must declare kernel-artifacts.json")
+            and Path(config["manifest"]).name == MANIFEST,
+            "kernel action must declare " + MANIFEST)
 
 
 def compilation_commands(architecture="amd64"):
-    """Only source/configuration/build/install targets; never binary packages."""
+    """Use the same source/configuration and Debian binary recipe as Makefile."""
     validate_architecture(architecture)
     kernel = "/build/source/linux-6.12.41"
     return [
         ["/usr/bin/dpkg-source", "-x", "/build/archives/linux_6.12.41-1.dsc", kernel],
         ["/bin/cp", "-a", "/build/source/config.local", "/build/source/patches-sonic", kernel + "/debian/"],
         ["/usr/bin/patch", "-d", kernel, "-p1", "-i", "/build/source/patches-debian/disable-secureboot-config-checks.patch"],
+        ["/usr/bin/patch", "-d", kernel, "-p1", "-i", "/build/source/patches-debian/bazel-debug-sources.patch"],
         ["/bin/bash", "-ec", "cd " + kernel +
          f" && if test -f debian/config.local/{architecture}/config.sonic-vs; then "
          f"cp debian/config.local/{architecture}/config.sonic-vs debian/config.local/{architecture}/config.sonic-platform-specific; fi"
          f" && /build/source/manage-config {architecture} no_sign '' && debian/bin/gencontrol.py"],
-        ["/usr/bin/make", "-C", kernel, "-f", "debian/rules.gen", "-j4",
-         f"build-arch_{architecture}_sonic_{architecture}_image", f"build-arch_{architecture}_kbuild"],
-        ["/usr/bin/make", "-C", kernel, "-f", "/build/source/tools/bazel/stage-kernel.mk",
-         "sonic-install-kbuild", "ABINAME=6.12.41+deb13", "ARCH=" + architecture,
-         "KERNEL_ARCH=" + kernel_architecture(architecture),
-         "VERSION=6.12", "SOURCEVERSION=6.12.41-1", "DESTDIR=/build/stage/development"],
-        ["/usr/bin/python3", "/build/source/tools/bazel/stage_kernel.py", kernel, "/build/stage", "/build/artifacts",
-         "--architecture", architecture],
+        ["/bin/bash", "-ec", "cd " + kernel + " && /usr/bin/dpkg-buildpackage -b -us -uc -Pnodoc -j4"],
     ]
 
 
+def package_record(path, architecture="amd64", root=None):
+    command = ["/usr/bin/dpkg-deb", "--show", "--showformat=${Package}\t${Version}\t${Architecture}",
+               "/" + str(path.relative_to(root)) if root is not None else str(path)]
+    result = (in_chroot(root, command, check=True, text=True, capture_output=True) if root is not None
+              else subprocess.run(command, check=True, text=True, capture_output=True))
+    package, version, binary_arch = result.stdout.split("\t")
+    require(version == PACKAGE_VERSION and binary_arch in (architecture, "all"),
+            "unexpected Debian kernel package version or architecture")
+    require(path.name == f"{package}_{version}_{binary_arch}.deb", "Debian filename differs from control metadata")
+    return {"name": path.name, "kind": package_kinds(architecture).get(path.name, "other"),
+            "package": package, "version": version, "architecture": binary_arch,
+            "sha256": sha256(path), "size": path.stat().st_size}
+
+
+def created_package_records(directory, architecture="amd64", root=None):
+    records = [package_record(path, architecture, root) for path in sorted(directory.glob("*.deb"))]
+    names = {item["name"] for item in records}
+    require(package_names(architecture) <= names, "Debian build omitted required kernel packages")
+    return [{**item, "exported": item["name"] in package_names(architecture)} for item in records]
+
+
 def build(config):
-    require(config.get("schema") == 2, "unsupported kernel action schema")
+    require(config.get("schema") == 3, "unsupported kernel action schema")
     validate_outputs(config)
     architecture = config.get("architecture", "amd64")
     require(os.geteuid() == 0, "kernel action requires root in its disposable worker for chroot")
@@ -178,24 +207,23 @@ def build(config):
             "KBUILD_BUILD_VERSION": "1", "DEB_BUILD_OPTIONS": "parallel=4",
             "DEB_BUILD_PROFILES": "nodoc",
             "INCLUDE_EXTERNAL_PATCHES": "n",
+            "SONIC_KERNEL_DEBUG_STAGE": "/build/source/tools/bazel/stage_kernel.py",
         }
         print("SONIC_KERNEL_COMPILATION_STARTED", flush=True)
         for command in compilation_commands(architecture):
             in_chroot(root, command, env=environment, check=True)
-        # A source build may read declared Debian inputs, but must create no DEBs.
-        require(not any(path.suffix in (".deb", ".udeb", ".ddeb") for path in source.rglob("*")),
-                "kernel TAR build unexpectedly created a Debian binary package")
-        artifacts = []
+        # Record every package before removing the disposable build tree. Only
+        # the five declared image/debug/headers/kbuild DEBs become Bazel outputs.
+        created = created_package_records(source, architecture, root)
+        packages = []
         for name in config["outputs"]:
             output = Path(name)
-            artifact = dest / output.name
-            require(artifact.is_file(), "kernel build omitted required TAR: " + artifact.name)
-            artifacts.append({"name": artifact.name, "kind": ARTIFACT_KINDS[artifact.name],
-                              "sha256": sha256(artifact), "size": artifact.stat().st_size})
+            package = source / output.name
+            packages.append(package_record(package, architecture, root))
             output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(artifact, output)
+            shutil.copyfile(package, output)
         manifest = {
-            "schema": 2, "architecture": architecture, "platform": "vs",
+            "schema": 3, "architecture": architecture, "platform": "vs",
             "kernel_version": "6.12.41", "kernel_abi": kernel_abi(architecture),
             "package_version": "6.12.41-1", "signing": "unsigned",
             "source_date_epoch": SOURCE_DATE_EPOCH,
@@ -203,7 +231,8 @@ def build(config):
             "source_tree_sha256": source_tree_sha256(inventory),
             "source_files": inventory,
             "build_tools": marker,
-            "artifacts": sorted(artifacts, key=lambda entry: entry["name"]),
+            "packages": sorted(packages, key=lambda entry: entry["name"]),
+            "created_packages": created,
             "debug": json.loads((dest / "debug-validation.json").read_text()),
         }
         Path(config["manifest"]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

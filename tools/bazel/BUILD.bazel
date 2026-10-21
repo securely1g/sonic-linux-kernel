@@ -7,7 +7,6 @@ exports_files([
     "kernel_action.py",
     "kernel_arch.py",
     "stage_kernel.py",
-    "stage-kernel.mk",
 ])
 
 python_runtime(name = "python_runtime")
@@ -15,6 +14,7 @@ python_runtime(name = "python_runtime")
 py_test(
     name = "kernel_action_test",
     srcs = [
+        "deb_test_support.py",
         "kernel_action.py",
         "kernel_action_test.py",
         "kernel_arch.py",
@@ -25,6 +25,7 @@ py_test(
 py_test(
     name = "verify_cache_test",
     srcs = [
+        "deb_test_support.py",
         "kernel_action.py",
         "kernel_arch.py",
         "verify_cache.py",

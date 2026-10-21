@@ -174,7 +174,7 @@ def main():
     parser.add_argument("--disk-cache", type=Path)
     parser.add_argument("--remote-cache")
     parser.add_argument("--remote-cache-read-only", action="store_true")
-    parser.add_argument("--target", default="@sonic_linux_kernel//:kernel_artifacts")
+    parser.add_argument("--target", default="@sonic_linux_kernel//:kernel_packages")
     parser.add_argument("--worker-image", default=WORKER_IMAGE)
     parser.add_argument("--architecture", choices=tuple(ARCHITECTURES),
                         help="native build architecture (defaults to the Linux host architecture)")
