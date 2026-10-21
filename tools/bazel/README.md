@@ -48,6 +48,8 @@ resolution uses the canonical SONiC registry `main` plus the Bazel Central Regis
 ```sh
 python3 tools/bazel/build.py \
   --architecture amd64 \
+  --workspace tools/bazel/cache-consumer \
+  --module-override "sonic-linux-kernel=$PWD" \
   --work-dir /tmp/kernel-cold \
   --repository-cache /tmp/kernel-downloads \
   --remote-cache http://127.0.0.1:8080
@@ -67,6 +69,8 @@ configure a disk cache for this proof:
 ```sh
 python3 tools/bazel/build.py \
   --architecture amd64 --work-dir /tmp/kernel-hit \
+  --workspace tools/bazel/cache-consumer \
+  --module-override "sonic-linux-kernel=$PWD" \
   --repository-cache /tmp/kernel-downloads \
   --remote-cache http://127.0.0.1:8080 --remote-cache-read-only
 python3 tools/bazel/verify_cache.py \
