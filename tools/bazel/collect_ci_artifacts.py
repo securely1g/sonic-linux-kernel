@@ -230,6 +230,7 @@ def validate_payload(archive, kind, architecture="amd64", *, debugger_sources=()
         require(all(name.startswith("usr/lib/debug/") and name.endswith(".ko") for name in modules),
                 "debug package contains misplaced or compressed modules")
         require(all(name.startswith(("usr/lib/debug/", "usr/share/doc/", "usr/src/debug/linux-" + abi + "/"))
+                    or name == "usr/share/lintian/overrides/linux-image-" + abi + "-dbg"
                     for name in regular), "runtime payload in debug package")
     elif kind == "headers":
         headers = "usr/src/linux-headers-" + abi + "/"

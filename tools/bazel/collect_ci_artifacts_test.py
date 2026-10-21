@@ -71,7 +71,8 @@ def fixture(root, architecture="amd64"):
     members = {
         "runtime": ["boot/vmlinuz-" + abi, "boot/config-" + abi,
                     "usr/lib/modules/" + abi + "/kernel/example.ko.xz"],
-        "debug": ["usr/lib/debug/boot/vmlinux-" + abi,
+        "debug": ["usr/share/lintian/overrides/linux-image-" + abi + "-dbg",
+                  "usr/lib/debug/boot/vmlinux-" + abi,
                   "usr/lib/debug/lib/modules/" + abi + "/kernel/example.ko",
                   "usr/src/debug/linux-" + abi + "/debian/build/source_sonic/init/main.c",
                   "usr/src/debug/linux-" + abi + "/debian/build/source_sonic/drivers/net/dummy.c"],
