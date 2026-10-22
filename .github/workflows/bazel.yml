@@ -1,10 +1,12 @@
-name: Bazel kernel
+name: Validate kernel with shared build tools
 
 on:
-  pull_request:
   push:
-    branches: [master]
+    branches: [codex/validate-kernel-shared-tools-20261022]
   workflow_dispatch:
+
+env:
+  SHARED_BUILD_TOOLS_REVISION: 566a87bbc53c7751ccbad249223ef8dca85f05f8
 
 permissions:
   contents: read
@@ -50,6 +52,35 @@ jobs:
           test "$(uname -m)" = '${{ matrix.machine }}'
           test "$(dpkg --print-architecture)" = '${{ matrix.architecture }}'
           echo 'Native Linux ${{ matrix.name }} runner verified.'
+      - name: Check out the shared build-tools candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: securely1g/sonic-build-infra
+          ref: ${{ env.SHARED_BUILD_TOOLS_REVISION }}
+          path: .kernel-validation/sonic-build-infra
+          persist-credentials: false
+      - name: Verify the exact shared build-tools source
+        id: shared_tools
+        run: |
+          test "$(git -C .kernel-validation/sonic-build-infra rev-parse HEAD)" = "$SHARED_BUILD_TOOLS_REVISION"
+          test -z "$(git -C .kernel-validation/sonic-build-infra status --porcelain)"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          module = Path('.kernel-validation/sonic-build-infra/MODULE.bazel').read_text()
+          assert module.count('dependency_set = "build_tools"') == 1
+          assert 'kernel_build_tools' not in module
+          receipt = Path(os.environ['RUNNER_TEMP']) / 'shared-build-tools.json'
+          receipt.write_text(json.dumps({
+              'schema': 1,
+              'repository': 'securely1g/sonic-build-infra',
+              'commit': os.environ['SHARED_BUILD_TOOLS_REVISION'],
+              'package_set': 'build_tools',
+              'source_checkout_verified': True,
+          }, indent=2) + '\n')
+          PY
+          echo "Kernel validation uses sonic-build-infra@$SHARED_BUILD_TOOLS_REVISION."
       - name: Prepare independent consumers using the canonical registry
         run: |
           python3 - <<'PY_REGISTRY'
@@ -118,6 +149,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/kernel-private/cold" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
+            --module-override "sonic-build-infra=$GITHUB_WORKSPACE/.kernel-validation/sonic-build-infra" \
             --target @sonic_linux_kernel//:kernel_packages \
             --remote-cache http://127.0.0.1:8080 \
             --bazel-arg=--strategy=SonicKernelBuild=local \
@@ -148,6 +180,7 @@ jobs:
             --work-dir "$RUNNER_TEMP/kernel-private/hit" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
             --module-override "sonic-linux-kernel=$GITHUB_WORKSPACE" \
+            --module-override "sonic-build-infra=$GITHUB_WORKSPACE/.kernel-validation/sonic-build-infra" \
             --target @sonic_linux_kernel//:kernel_packages \
             --remote-cache http://127.0.0.1:8080 --remote-cache-read-only \
             --bazel-arg=--strategy=SonicKernelBuild=local \
@@ -200,7 +233,10 @@ jobs:
             --architecture '${{ matrix.architecture }}' \
             --private-root "$RUNNER_TEMP/kernel-private" --source-root "$GITHUB_WORKSPACE" \
             --output "$RUNNER_TEMP/kernel-artifacts" --job-status "$KERNEL_JOB_STATUS"
-      - name: Upload Debian packages and validation summary
+      - name: Retain the verified shared-tools revision
+        if: always() && steps.collect.outcome == 'success' && steps.shared_tools.outcome == 'success'
+        run: cp "$RUNNER_TEMP/shared-build-tools.json" "$RUNNER_TEMP/kernel-artifacts/shared-build-tools.json"
+      - name: Publish verified kernel artifacts
         if: always() && steps.collect.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -210,6 +246,7 @@ jobs:
           path: |
             ${{ runner.temp }}/kernel-artifacts/*.deb
             ${{ runner.temp }}/kernel-artifacts/validation.json
+            ${{ runner.temp }}/kernel-artifacts/shared-build-tools.json
       - name: Stop this job's cache
         if: always()
         run: docker rm -f sonic-kernel-cache > "$RUNNER_TEMP/kernel-private/cache-stop.log" 2>&1 || true
