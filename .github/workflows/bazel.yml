@@ -99,7 +99,7 @@ jobs:
             echo "Cache startup failed with exit code $status."
             exit "$status"
           fi
-      - name: Compile the kernel from declared sources
+      - name: Compile the kernel directly from declared sources
         run: |
           umask 077
           if curl --fail --show-error --silent --retry 15 --retry-delay 1 \
@@ -114,6 +114,7 @@ jobs:
           fi
           if python3 tools/bazel/build.py \
             --architecture '${{ matrix.architecture }}' \
+            --execution-mode direct \
             --workspace "$RUNNER_TEMP/kernel-private/cold-consumer" \
             --work-dir "$RUNNER_TEMP/kernel-private/cold" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
@@ -128,7 +129,7 @@ jobs:
             echo "Kernel source command failed with exit code $status."
             exit "$status"
           fi
-      - name: Fetch from the remote cache in a fresh Bazel output directory
+      - name: Fetch from the remote cache in a fresh container
         timeout-minutes: 10
         run: |
           umask 077
@@ -144,6 +145,7 @@ jobs:
           fi
           if python3 tools/bazel/build.py \
             --architecture '${{ matrix.architecture }}' \
+            --execution-mode container \
             --workspace "$RUNNER_TEMP/kernel-private/hit-consumer" \
             --work-dir "$RUNNER_TEMP/kernel-private/hit" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
@@ -164,6 +166,7 @@ jobs:
           if python3 tools/bazel/verify_cache.py \
             --architecture '${{ matrix.architecture }}' \
             --cold "$RUNNER_TEMP/kernel-private/cold" --hit "$RUNNER_TEMP/kernel-private/hit" \
+            --cold-execution-mode direct --hit-execution-mode container \
             --artifacts "$RUNNER_TEMP/kernel-private/verified" \
             > "$RUNNER_TEMP/kernel-private/verify.log" 2>&1; then
             echo "Kernel source and cache verification passed."

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the declared kernel build in a disposable Linux worker."""
+"""Run the declared kernel build directly or in a disposable Linux worker."""
 
 import argparse
 import hashlib
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import ssl
 import subprocess
 import sys
@@ -67,19 +68,20 @@ def bazel_binary(directory, ca_bundle=None, architecture="amd64"):
     return path
 
 
-def worker_command(args, executable, name):
+def execution_script(args, executable, workspace, work, repository_cache, *, direct=False):
+    """Use the same Bazel configuration with paths visible to its executor."""
     config = ARCHITECTURES[args.architecture]
     platform = "@sonic_build_infra//platforms:" + config["platform"]
-    workspace = args.workspace.resolve()
-    work = args.work_dir.resolve()
-    repository_cache = (args.repository_cache or work / "repository-cache").resolve()
-    repository_cache.mkdir(parents=True, exist_ok=True)
-    bazel = ["/usr/local/bin/bazel", "--output_user_root=/work/output"]
+    def quote(path):
+        return shlex.quote(str(path))
+    bazel = [str(executable), "--nosystem_rc", "--nohome_rc", "--output_user_root=" + str(work / "output")]
     if args.java_trust_store:
-        bazel.append("--host_jvm_args=-Djavax.net.ssl.trustStore=/trust/cacerts")
+        trust_store = args.java_trust_store.resolve() if direct else Path("/trust/cacerts")
+        bazel.append("--host_jvm_args=-Djavax.net.ssl.trustStore=" + str(trust_store))
+    disk_cache = str(args.disk_cache.resolve()) if direct and args.disk_cache else "/disk-cache" if args.disk_cache else ""
     common = [
-        "--repository_cache=/repository-cache", "--lockfile_mode=update",
-        "--symlink_prefix=/work/bazel-", "--disk_cache=" + ("/disk-cache" if args.disk_cache else ""),
+        "--repository_cache=" + str(repository_cache), "--lockfile_mode=update",
+        "--symlink_prefix=" + str(work / "bazel-"), "--disk_cache=" + disk_cache,
         # Download the tool tree before local execution: Bazel 8 lazy input
         # materialization mishandles nested directory aliases in Debian tools.
         "--remote_download_outputs=all",
@@ -92,20 +94,19 @@ def worker_command(args, executable, name):
         common += ["--remote_cache=" + args.remote_cache,
                    "--remote_upload_local_results=" + str(not args.remote_cache_read_only).lower()]
     if args.ca_bundle:
-        common += ["--repo_env=SSL_CERT_FILE=/trust/ca-bundle.pem",
-                   "--repo_env=REQUESTS_CA_BUNDLE=/trust/ca-bundle.pem"]
+        ca_bundle = args.ca_bundle.resolve() if direct else Path("/trust/ca-bundle.pem")
+        common += ["--repo_env=SSL_CERT_FILE=" + str(ca_bundle),
+                   "--repo_env=REQUESTS_CA_BUNDLE=" + str(ca_bundle)]
     if args.distdir:
-        common.append("--distdir=/distdir")
-    for module, _directory in args.module_override:
-        common.append("--override_module=" + module + "=/module-overrides/" + module)
+        common.append("--distdir=" + str(args.distdir.resolve() if direct else Path("/distdir")))
+    for module, directory in args.module_override:
+        common.append("--override_module=" + module + "=" + str(directory.resolve() if direct else Path("/module-overrides") / module))
     common += args.bazel_arg
     build = bazel + ["build"] + common + [
-        "--execution_log_json_file=/work/execution.json",
-        "--profile=/work/profile.json.gz", "--build_event_json_file=/work/bep.json", args.target,
+        "--execution_log_json_file=" + str(work / "execution.json"),
+        "--profile=" + str(work / "profile.json.gz"), "--build_event_json_file=" + str(work / "bep.json"), args.target,
     ]
     query = bazel + ["cquery"] + common + ["--output=files", args.target]
-    # Retain the resolved graph separately from the build result. Consumers
-    # inspect its completeness and pins before accepting the artifact bundle.
     graph_options = [option for option in common if option.startswith((
         "--repository_cache=", "--repo_env=", "--distdir=", "--override_module=", "--registry=",
     ))]
@@ -113,36 +114,63 @@ def worker_command(args, executable, name):
         "--output=json", "--extension_info=hidden", "--lockfile_mode=off",
         "--color=no", "--curses=no",
     ]
-    script = "\n".join([
-        "set -euo pipefail", "export HOME=/work/home", "mkdir -p /work/home",
-        '[[ "$(uname -m)" == ' + shlex.quote(config["machine"]) + " ]]",
-        # Only this invocation's work directory is owned by the launcher.
-        "trap 'chown -hR " + str(os.getuid()) + ":" + str(os.getgid()) + " /work' EXIT",
-        # Bazel requires its output-user-root to belong to the executing UID.
-        # EXIT returns artifacts to the caller, so reclaim this dedicated
-        # subtree before a subsequent invocation. Never follow a redirected root.
-        "if [[ -L /work/output || ( -e /work/output && ! -d /work/output ) ]]; then echo 'Invalid Bazel output directory' >&2; exit 1; fi",
-        "mkdir -p /work/output",
-        "chown -hR 0:0 /work/output",
-        # rules_distroless decompresses fetched APT indexes before the declared
-        # execution runtime exists. This is repository bootstrap, not a kernel
-        # compiler/tool input; the downloaded payloads are checksum-verified.
-        "if ! command -v xz >/dev/null; then",
-        "  apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update",
-        "  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends xz-utils",
-        "fi",
-        shlex.join(build),
-        shlex.join(query) + " > /work/output-paths.relative.txt",
-        "set +e",
-        shlex.join(graph) + " > /work/module-graph.json 2> /work/module-graph.stderr",
-        "graph_status=$?",
-        "set -e",
-        "printf '%s\\n' \"$graph_status\" > /work/module-graph.exit-code",
-        # The symlink points into this invocation's execution root. `bazel
-        # info` does not resolve apparent platform repository names reliably.
-        'execution_root=$(dirname "$(realpath /work/bazel-out)")',
-        'while IFS= read -r output; do realpath "$execution_root/$output"; done < /work/output-paths.relative.txt > /work/output-paths.txt',
-    ])
+    script = [
+        "set -euo pipefail", "bazel_started=0", "cd -- " + quote(workspace),
+        "export HOME=" + quote(work / "home"), "mkdir -p -- " + quote(work / "home"),
+        '[[ "$(uname -m)" == ' + quote(config["machine"]) + " ]]",
+        "cleanup() {",
+        "  status=$?; trap - EXIT INT TERM",
+    ]
+    if direct:
+        # Container removal used to terminate this private Bazel server. In
+        # direct mode finish it before returning the work tree to the caller.
+        script.append("  if (( bazel_started )); then " + shlex.join(bazel + ["shutdown"]) + " >/dev/null 2>&1 || { echo 'Bazel shutdown failed' >&2; status=1; }; fi")
+        # The generated root-module lock lives outside the dedicated work tree.
+        # With a private caller umask it otherwise becomes unreadable root:root.
+        lock = quote(workspace / "MODULE.bazel.lock")
+        script += [
+            "  if [[ -L " + lock + " || ( -e " + lock + " && ! -f " + lock + " ) ]]; then echo 'Invalid generated module lock' >&2; status=1;",
+            "  elif [[ -f " + lock + " ]]; then chown -h " + str(os.getuid()) + ":" + str(os.getgid()) + " -- " + lock + " || status=1; fi",
+        ]
+    script += [
+        "  chown -hR " + str(os.getuid()) + ":" + str(os.getgid()) + " -- " + quote(work) + " || status=1",
+        '  exit "$status"', "}", "trap cleanup EXIT",
+        "trap 'exit 130' INT", "trap 'exit 143' TERM",
+        "if [[ -L " + quote(work / "output") + " || ( -e " + quote(work / "output") + " && ! -d " + quote(work / "output") + " ) ]]; then echo 'Invalid Bazel output directory' >&2; exit 1; fi",
+        "mkdir -p -- " + quote(work / "output"), "chown -hR 0:0 -- " + quote(work / "output"),
+    ]
+    if direct:
+        script += [
+            "if [[ -L " + lock + " || ( -e " + lock + " && ! -f " + lock + " ) ]]; then echo 'Invalid generated module lock' >&2; exit 1; fi",
+            "(umask 022; mkdir -p -- " + " ".join(quote(path) for path in (repository_cache, args.disk_cache.resolve() if args.disk_cache else None) if path is not None) + ")",
+            shlex.join([sys.executable, str(Path(__file__).with_name("direct_permissions.py").resolve()), str(work)]),
+            "command -v xz >/dev/null || { echo 'Direct kernel execution requires xz in the build environment' >&2; exit 1; }",
+        ]
+    else:
+        script += [
+            "if ! command -v xz >/dev/null; then",
+            "  apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update",
+            "  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends xz-utils",
+            "fi",
+        ]
+    if args.ca_bundle:
+        script += ["export SSL_CERT_FILE=" + quote(ca_bundle), "export REQUESTS_CA_BUNDLE=" + quote(ca_bundle)]
+    script += [
+        "bazel_started=1", shlex.join(build), shlex.join(query) + " > " + quote(work / "output-paths.relative.txt"),
+        "set +e", shlex.join(graph) + " > " + quote(work / "module-graph.json") + " 2> " + quote(work / "module-graph.stderr"),
+        "graph_status=$?", "set -e",
+        "printf '%s\\n' \"$graph_status\" > " + quote(work / "module-graph.exit-code"),
+        'execution_root=$(dirname "$(realpath ' + quote(work / "bazel-out") + ')")',
+        'while IFS= read -r output; do realpath "$execution_root/$output"; done < ' + quote(work / "output-paths.relative.txt") + " > " + quote(work / "output-paths.txt"),
+    ]
+    return "\n".join(script)
+
+
+def worker_command(args, executable, name):
+    workspace, work = args.workspace.resolve(), args.work_dir.resolve()
+    repository_cache = (args.repository_cache or work / "repository-cache").resolve()
+    repository_cache.mkdir(parents=True, exist_ok=True)
+    script = execution_script(args, Path("/usr/local/bin/bazel"), Path("/workspace"), Path("/work"), Path("/repository-cache"))
     docker = [
         "docker", "run", "--rm", "--init", "--name", name, "--platform=linux/" + args.architecture,
         "--cpus=4", "--memory=12g", "--memory-swap=12g", "--network=host",
@@ -166,6 +194,18 @@ def worker_command(args, executable, name):
     return docker + [args.worker_image, "/bin/bash", "-c", script]
 
 
+def direct_command(args, executable):
+    work = args.work_dir.resolve()
+    repository_cache = (args.repository_cache or work / "repository-cache").resolve()
+    script = execution_script(args, executable, args.workspace.resolve(), work, repository_cache, direct=True)
+    command = ["/bin/bash", "-c", script]
+    if os.geteuid() != 0:
+        # SONiC's builder user has noninteractive sudo. Preserve fetch proxies,
+        # not arbitrary caller configuration or credentials, across elevation.
+        command = ["sudo", "-n", "--preserve-env=http_proxy,https_proxy,no_proxy,HTTP_PROXY,HTTPS_PROXY,NO_PROXY", "--"] + command
+    return command
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", required=True, type=Path)
@@ -175,6 +215,8 @@ def main():
     parser.add_argument("--remote-cache")
     parser.add_argument("--remote-cache-read-only", action="store_true")
     parser.add_argument("--target", default="@sonic_linux_kernel//:kernel_packages")
+    parser.add_argument("--execution-mode", choices=("container", "direct"), default="container",
+                        help="use a disposable worker, or root/noninteractive sudo in the existing build environment")
     parser.add_argument("--worker-image", default=WORKER_IMAGE)
     parser.add_argument("--architecture", choices=tuple(ARCHITECTURES),
                         help="native build architecture (defaults to the Linux host architecture)")
@@ -188,6 +230,8 @@ def main():
         args.architecture = native_architecture(args.architecture)
     except ValueError as error:
         parser.error(str(error))
+    if args.execution_mode == "direct" and args.worker_image != WORKER_IMAGE:
+        parser.error("--worker-image applies only to container execution")
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64}", args.worker_image):
         parser.error("--worker-image requires an immutable image digest")
     if not (args.workspace / "MODULE.bazel").is_file():
@@ -226,17 +270,25 @@ def main():
     args.work_dir.mkdir(parents=True, exist_ok=True)
     executable = bazel_binary(args.work_dir / "bootstrap", args.ca_bundle, args.architecture).resolve()
     name = "sonic-kernel-bazel-" + uuid.uuid4().hex[:16]
-    command = worker_command(args, executable, name)
+    command = direct_command(args, executable) if args.execution_mode == "direct" else worker_command(args, executable, name)
     (args.work_dir / "invocation.json").write_text(json.dumps({
-        "schema": 1, "worker": args.worker_image, "target": args.target,
+        "schema": 1, "execution_mode": args.execution_mode,
+        "worker": args.worker_image if args.execution_mode == "container" else None, "target": args.target,
+        "workspace": str(workspace), "work_dir": str(work), "execution_uid": 0,
+        "caller_uid": os.getuid(), "caller_gid": os.getgid(),
+        "repository_cache": str((args.repository_cache or work / "repository-cache").resolve()),
         "architecture": args.architecture, "host_machine": os.uname().machine,
         "remote_cache": args.remote_cache, "remote_cache_read_only": args.remote_cache_read_only,
         "disk_cache": str(args.disk_cache.resolve()) if args.disk_cache else None,
     }, indent=2) + "\n")
     process = None
+    previous_term = signal.getsignal(signal.SIGTERM)
+    def interrupted(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         with (args.work_dir / "build.log").open("w") as log:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
             for line in process.stdout:
                 log.write(line)
                 log.flush()
@@ -244,9 +296,15 @@ def main():
                 sys.stdout.flush()
             return process.wait()
     finally:
+        signal.signal(signal.SIGTERM, previous_term)
         if process is not None and process.poll() is None:
-            subprocess.run(["docker", "stop", "--time=20", name], check=False)
+            if args.execution_mode == "container":
+                subprocess.run(["docker", "stop", "--time=20", name], check=False)
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
             process.wait()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
 
 
 if __name__ == "__main__":

@@ -88,10 +88,43 @@ installed only in a debug image; header and kbuild DEBs belong in module build
 environments. Buildimage uses the four original Make packages for its ordinary
 kernel/module flow and consumes the debug package when requested.
 
+## Direct execution inside an existing SONiC builder
+
+Use `--execution-mode direct` to run the pinned Bazel executable inside the
+current build environment. The default `container` mode still starts the pinned
+Docker worker for standalone host builds. Direct mode uses the actual workspace,
+work, cache, module-override, certificate and source-archive paths; it needs no
+Docker socket or host-path aliases.
+
+The kernel action already needs root, `chroot`, and permission to create/open
+`null`, `zero`, `random`, and `urandom` character devices. Direct execution uses
+noninteractive `sudo` when called by the SONiC build user and checks those
+permissions in a disposable work directory before Bazel starts. It requires `xz`
+in the existing environment and does not install host packages. CPU and memory
+limits come from the existing build container; Bazel uses one job and the kernel
+recipe retains four compile jobs. Additional blanket container privileges are not
+required by this mode.
+
+Use dedicated root-owned repository/disk cache directories (buildimage uses its
+existing kernel cache namespace). The launcher creates missing cache directories
+after elevation and leaves persistent caches outside the work directory root-owned,
+separate from the nonroot SWSS cache. The default private repository cache lives
+inside the work directory and is returned with it. The launcher shuts down its
+private Bazel server and returns only the
+dedicated work tree and the exact generated consumer `MODULE.bazel.lock` to the
+calling UID/GID, including on build failure or interruption. It rejects redirected
+module locks and never recursively changes source-workspace ownership. System/home Bazel rc files are disabled in both modes; the consumer's
+workspace rc and explicit cache options remain authoritative. Invocation evidence
+records the execution mode and actual paths; direct execution records no worker
+image. Output-path verification accepts direct outputs only inside that
+invocation's private Bazel output directory.
+
 ## Native CI and publication boundary
 
 CI builds from source independently on `ubuntu-24.04` AMD64 and
-`ubuntu-24.04-arm` ARM64, then proves a fresh read-only remote-cache hit. A fresh
+`ubuntu-24.04-arm` ARM64 using direct execution, then proves a fresh read-only
+remote-cache hit from container mode. The verifier checks both execution modes
+and identical action/output identities across the boundary. A fresh
 native Trixie container installs all five DEBs with apt, verifies dpkg package
 identities/configuration and ARM64 device trees, verifies the postinst-generated
 ABI initramfs, compiles an external module using installed headers/kbuild, and checks its native ELF

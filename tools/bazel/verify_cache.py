@@ -59,10 +59,27 @@ def unique_object(pairs):
     return result
 
 
+def execution_mode(directory):
+    invocation_path = directory / "invocation.json"
+    invocation = json.loads(invocation_path.read_text()) if invocation_path.exists() else {}
+    mode = invocation.get("execution_mode", "container")
+    require(mode in {"container", "direct"}, "unsupported kernel execution mode")
+    if mode == "direct":
+        require(invocation.get("worker") is None and type(invocation.get("execution_uid")) is int
+                and invocation["execution_uid"] == 0
+                and invocation.get("work_dir") == str(directory.resolve()),
+                "direct invocation differs from its owned work directory or execution identity")
+    return mode
+
+
 def outputs(directory, architecture="amd64"):
+    mode = execution_mode(directory)
+    prefix = str(directory.resolve()) if mode == "direct" else "/work"
     found = {}
     for line in (directory / "output-paths.txt").read_text().splitlines():
-        relative = PurePosixPath(line).relative_to("/work")
+        relative = PurePosixPath(line).relative_to(prefix)
+        require(mode != "direct" or relative.parts[:1] == ("output",),
+                "direct kernel output is outside its private Bazel output directory")
         require(".." not in relative.parts, "output escaped the build directory")
         path = directory
         for part in relative.parts:
@@ -102,7 +119,7 @@ def outputs(directory, architecture="amd64"):
     return found
 
 
-def verify(cold, hit, destination, architecture="amd64"):
+def verify(cold, hit, destination, architecture="amd64", *, cold_execution_mode=None, hit_execution_mode=None):
     kernel_abi(architecture)
     require(cold.resolve() != hit.resolve(), "cache proof requires distinct Bazel output directories")
     first, second = kernel_record(cold), kernel_record(hit)
@@ -111,7 +128,10 @@ def verify(cold, hit, destination, architecture="amd64"):
             "consumer did not get the kernel action from the remote cache")
     for field in ("commandArgs", "environmentVariables", "platform", "inputs", "listedOutputs"):
         require(first.get(field) == second.get(field), "producer and consumer kernel actions differ: " + field)
-    for directory in (cold, hit):
+    modes = {}
+    for name, directory, expected_mode in (("cold", cold, cold_execution_mode), ("hit", hit, hit_execution_mode)):
+        modes[name] = execution_mode(directory)
+        require(expected_mode is None or modes[name] == expected_mode, "cache proof execution mode differs for " + name)
         invocation = json.loads((directory / "invocation.json").read_text())
         require(invocation.get("disk_cache") is None, "cache proof must disable the disk cache")
         require(invocation.get("architecture", "amd64") == architecture,
@@ -127,6 +147,7 @@ def verify(cold, hit, destination, architecture="amd64"):
     receipt = {"schema": 1, "result": "passed", "architecture": architecture, "cold_compiled": True,
                "consumer_kernel_runner": second["runner"], "consumer_kernel_cache_hit": True,
                "kernel_compilation_skipped": True, "outputs_sha256": hashes,
+               "cold_execution_mode": modes["cold"], "hit_execution_mode": modes["hit"],
                "cold_metrics": first.get("metrics"), "hit_metrics": second.get("metrics")}
     (destination / "cache-proof.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     return receipt
@@ -138,8 +159,11 @@ def main():
     parser.add_argument("--hit", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="amd64")
+    parser.add_argument("--cold-execution-mode", choices=("container", "direct"))
+    parser.add_argument("--hit-execution-mode", choices=("container", "direct"))
     args = parser.parse_args()
-    receipt = verify(args.cold, args.hit, args.artifacts, args.architecture)
+    receipt = verify(args.cold, args.hit, args.artifacts, args.architecture,
+                     cold_execution_mode=args.cold_execution_mode, hit_execution_mode=args.hit_execution_mode)
     # The full receipt stays in the private destination. CLI output contains no
     # arbitrary execution metrics, environment values, or output paths.
     print(json.dumps({

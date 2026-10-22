@@ -66,6 +66,8 @@ def success_summary(private, source, architecture):
     require(all(proof.get(key) is True for key in (
         "cold_compiled", "consumer_kernel_cache_hit", "kernel_compilation_skipped",
     )) and proof.get("consumer_kernel_runner") == "remote cache hit", "missing remote cache proof")
+    modes = {name: proof.get(name, "container") for name in ("cold_execution_mode", "hit_execution_mode")}
+    require(all(mode in {"container", "direct"} for mode in modes.values()), "invalid cache execution modes")
     hashes = proof.get("outputs_sha256")
     require(isinstance(hashes, dict) and set(hashes) == package_names(architecture) | {MANIFEST}
             and all(isinstance(value, str) and DIGEST.fullmatch(value) for value in hashes.values()),
@@ -92,6 +94,7 @@ def success_summary(private, source, architecture):
     return {
         "checkout_revision": revision, "outputs_sha256": hashes,
         "cold_compiled": True, "consumer_kernel_cache_hit": True, "kernel_compilation_skipped": True,
+        **modes,
         "installation_verified": True, "debugger_verified": True,
         "cold_timing_seconds": timing_seconds(proof.get("cold_metrics")),
         "hit_timing_seconds": timing_seconds(proof.get("hit_metrics")),

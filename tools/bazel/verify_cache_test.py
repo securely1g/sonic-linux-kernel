@@ -91,6 +91,35 @@ class CacheProofTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "already exists"):
                     proof.verify(cold, hit, root / "evidence", architecture)
 
+    def test_direct_producer_and_container_consumer_have_identical_packages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); cold,hit=root/'cold',root/'hit'
+            for path,action in ((cold,record()),(hit,record(True,'remote cache hit'))):
+                outputs_fixture(path)
+                (path/'execution.json').write_text(json.dumps(action))
+            direct_output=cold/'output'; direct_output.mkdir()
+            for name in list(proof.package_kinds())+[proof.MANIFEST]:
+                (cold/name).rename(direct_output/name)
+            (cold/'output-paths.txt').write_text('\n'.join(str(direct_output/name) for name in list(proof.package_kinds())+[proof.MANIFEST]))
+            (cold/'invocation.json').write_text(json.dumps({'execution_mode':'direct','worker':None,'execution_uid':0,
+                'work_dir':str(cold),'disk_cache':None,'architecture':'amd64'}))
+            result=proof.verify(cold,hit,root/'verified',cold_execution_mode='direct',hit_execution_mode='container')
+            self.assertEqual(result['cold_execution_mode'],'direct'); self.assertEqual(result['hit_execution_mode'],'container')
+            with self.assertRaisesRegex(ValueError,'execution mode differs'):
+                proof.verify(cold,hit,root/'wrong-mode',cold_execution_mode='container')
+            value=json.loads((cold/'invocation.json').read_text()); value['work_dir']=str(root/'other')
+            (cold/'invocation.json').write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError,'owned work directory'):
+                proof.outputs(cold)
+
+    def test_direct_output_rejects_paths_outside_private_output_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'invocation.json').write_text(json.dumps({'execution_mode':'direct','worker':None,'execution_uid':0,'work_dir':str(root)}))
+            for output in (str(root/'kernel.deb'),str(root/'output/../escape.deb'),'/work/output/kernel.deb'):
+                (root/'output-paths.txt').write_text(output+'\n')
+                with self.assertRaises(ValueError): proof.outputs(root)
+
     def test_rejects_wrong_manifest_architecture_or_abi(self):
         for field in ("architecture", "kernel_abi"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
