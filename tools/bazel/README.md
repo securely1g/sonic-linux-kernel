@@ -95,27 +95,14 @@ checks require these records to agree in both consumers. The source timestamp
 remains pinned to Debian's changelog (`SOURCE_DATE_EPOCH=1754969284`); unknown Make
 keys are rejected rather than silently ignored.
 
-## Draft dependency validation
+## Shared build tools
 
-The AMD64 cross-tool runtime requires a new `sonic-build-infra` registration,
-`0.0.19-46f471185c80ac5fd758f995195a428a43e3831e`.
-Until that prerequisite lands, this PR stays Draft and its source CI explicitly
-selects the reviewed registry branch
-`codex/kernel-cross-tools-registry-20261023` through `KERNEL_DRAFT_REGISTRY`.
-Both the cold producer and fresh cache consumer pass the same two registry
-options to the launcher:
-
-```sh
---bazel-arg=--registry=https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-cross-tools-registry-20261023 \
---bazel-arg=--registry=https://bcr.bazel.build
-```
-
-The launcher replaces the SONiC endpoint rather than adding another branch as a
-fallback, and cache verification checks both invocations selected identical
-overrides. The committed `.bazelrc` default remains canonical `main`. Remove this
-Draft override and section after the prerequisite entry lands, verify the
-selected sources through `main`, and make the PR Ready. Report subsequent CI
-results separately; passing CI remains a merge requirement.
+The root build and fresh cache consumer select
+`sonic-build-infra@0.0.19-46f471185c80ac5fd758f995195a428a43e3831e`
+from the maintained SONiC registry `main`. This landed runtime provides native
+AMD64 tools and both ARM cross compilers. Both consumers use their committed
+`.bazelrc` registry settings, so source and cache validation resolve the same
+published recipe without a temporary registry override.
 
 ## Local build and cache reuse
 

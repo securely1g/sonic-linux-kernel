@@ -27,10 +27,6 @@ jobs:
 
   source-and-cache:
     name: ${{ matrix.name }} VS kernel source and remote cache
-    # Draft validation only: the cross-tool runtime entry is not yet on main.
-    # Remove this override after the prerequisite registry PR lands.
-    env:
-      KERNEL_DRAFT_REGISTRY: https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/codex/kernel-cross-tools-registry-20261023
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -144,8 +140,6 @@ jobs:
           fi
           if python3 tools/bazel/build.py \
             --architecture '${{ matrix.architecture }}' \
-            --bazel-arg=--registry="$KERNEL_DRAFT_REGISTRY" \
-            --bazel-arg=--registry=https://bcr.bazel.build \
             --workspace "$RUNNER_TEMP/kernel-private/cold-consumer" \
             --work-dir "$RUNNER_TEMP/kernel-private/cold" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
@@ -176,8 +170,6 @@ jobs:
           fi
           if python3 tools/bazel/build.py \
             --architecture '${{ matrix.architecture }}' \
-            --bazel-arg=--registry="$KERNEL_DRAFT_REGISTRY" \
-            --bazel-arg=--registry=https://bcr.bazel.build \
             --workspace "$RUNNER_TEMP/kernel-private/hit-consumer" \
             --work-dir "$RUNNER_TEMP/kernel-private/hit" \
             --repository-cache "$RUNNER_TEMP/kernel-private/downloads" \
