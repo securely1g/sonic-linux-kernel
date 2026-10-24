@@ -61,6 +61,8 @@ jobs:
             runner: ubuntu-22.04
             cache_sha256: 6a6b64666c2238ec6b49b7b29f5e41e4149de09417a0028897c9bffe40376876
     timeout-minutes: 300
+    env:
+      REGISTRY_REVISION: 01b7128186ec5fdb669477dc51fe4c1dc12dd4b5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,11 +77,13 @@ jobs:
           command -v xz
           unshare --user --map-current-user --mount --pid --fork true
           echo 'Native ${{ matrix.host }} host verified for ${{ matrix.architecture }} target build.'
-      - name: Prepare independent consumers using the canonical registry
+      - name: Prepare independent consumers using the reviewed registry snapshot
         run: |
           python3 - <<'PY_REGISTRY'
+          import json
           import os
           from pathlib import Path
+          import re
           import shutil
           os.umask(0o077)
           root = Path(os.environ["RUNNER_TEMP"]) / "kernel-private"
@@ -89,6 +93,16 @@ jobs:
           original = (template / ".bazelrc").read_text()
           if [line for line in original.splitlines() if line.startswith(prefix)] != [prefix + "main"]:
               raise SystemExit("Expected one SONiC registry entry selecting main")
+          revision = os.environ["REGISTRY_REVISION"]
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise SystemExit("Expected a full reviewed registry revision")
+          selected = original.replace(prefix + "main", prefix + revision)
+          (root / "effective.bazelrc").write_text(selected)
+          (root / "registry-inputs.json").write_text(json.dumps({
+              "declared_registry": prefix.removeprefix("common --registry=") + "main",
+              "registry": prefix.removeprefix("common --registry=") + revision,
+              "observed_revision": revision, "draft_validation": True,
+          }, indent=2) + "\n")
           for run in ("cold", "hit"):
               consumer = root / (run + "-consumer")
               consumer.mkdir()
@@ -97,8 +111,17 @@ jobs:
                   if not source.is_file() or source.is_symlink():
                       raise SystemExit("Expected regular consumer template files")
                   shutil.copyfile(source, consumer / name)
-              (consumer / ".bazelrc").write_text(original)
+              (consumer / ".bazelrc").write_text(selected)
           PY_REGISTRY
+      - name: Retain registry selection evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-${{ matrix.id }}-registry-inputs
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/kernel-private/effective.bazelrc
+            ${{ runner.temp }}/kernel-private/registry-inputs.json
+
       - name: Prepare runner disk space before the unprivileged build
         run: |
           # Runner provisioning only; no build command uses sudo.
