@@ -99,9 +99,9 @@ keys are rejected rather than silently ignored.
 
 The root build and fresh cache consumer select
 `sonic-build-infra@0.0.22-a12bc826d6f811a157db5c7c02a2fe033896cc14`
-with the maintained SONiC registry `main` as the default. Draft CI explicitly
-selects its reviewed registry snapshot until this candidate is published. The
-runtime provides native AMD64 tools and both ARM cross compilers.
+from the maintained SONiC registry `main`. CI records the current
+`main` revision for both independent cache consumers. The runtime provides
+native AMD64 tools and both ARM cross compilers.
 
 Both root configurations and the launcher select cached kernel-tool trees with
 `--remote_download_regex=(^|.*/)tools/build_tools/kernel_runtime_(amd64|arm64)(/.*)?$`.
