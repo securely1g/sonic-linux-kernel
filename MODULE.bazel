@@ -3,8 +3,10 @@ module(
     version = "0.0.2",
 )
 
-# Gazelle is used transitively by the build tools.
+# Keep the shared build tools' transitive rules at the registered versions.
 bazel_dep(name = "gazelle", version = "0.54.0.sonic.1", repo_name = None)
+bazel_dep(name = "rules_distroless", version = "0.9.4.sonic.22", repo_name = None)
+
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "patchelf", version = "0.18.0.bcr.1")
 bazel_dep(name = "rules_python", version = "1.9.0.sonic.1")
