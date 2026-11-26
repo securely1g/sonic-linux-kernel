@@ -23,7 +23,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - run: python3 -m unittest discover -s tools/bazel -p '*_test.py'
-      - run: python3 -m compileall -q tools/bazel
+      - run: python3 -m unittest discover -s native/tools/bazel -p '*_test.py'
+      - run: python3 -m compileall -q tools/bazel native/tools/bazel
 
   source-and-cache:
     name: ${{ matrix.name }} VS kernel source and remote cache

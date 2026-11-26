@@ -1,0 +1,77 @@
+--- a/debian/rules.real
++++ b/debian/rules.real
+@@ -273,8 +273,7 @@
+ 	if command -v dh_movetousr >/dev/null; then dh_movetousr; fi
+ 	dh_gencontrol -- $(GENCONTROL_ARGS)
+ 	dh_md5sums
+-	python3 "$(SONIC_KERNEL_DEBUG_STAGE)" --export-runtime "$(DESTDIR)" --architecture "$(SONIC_KERNEL_ARCHITECTURE)"
+-	dh_builddeb -- $(BUILDDEB_ARGS)
++	python3 "$(SONIC_KERNEL_DEBUG_STAGE)" --export-install "$(DESTDIR)" --architecture "$(SONIC_KERNEL_ARCHITECTURE)"
+ endef
+ 
+ build_meta:
+@@ -339,7 +338,7 @@
+ 		find include -print; \
+ 	) \
+ 	| \
+-	cpio -pd --preserve-modification-time '$(DIR)'
++	cpio -pLd --preserve-modification-time '$(DIR)'
+ 
+ 	dh_link /usr/lib/$(PACKAGE_NAME_KBUILD)/scripts $(BASE_DIR)/scripts
+ 	dh_link /usr/lib/$(PACKAGE_NAME_KBUILD)/tools $(BASE_DIR)/tools
+@@ -360,8 +359,8 @@
+ 	$(dh_binary_pre)
+ 
+ 	mkdir -p $(DIR)/arch/$(KERNEL_ARCH)/kernel
+-	cp -a $(SOURCE_DIR)/{.config,.kernel*,Module.symvers,include} $(DIR)
+-	cp -a $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/include $(DIR)/arch/$(KERNEL_ARCH)
++	cp -aL $(SOURCE_DIR)/{.config,.kernel*,Module.symvers,include} $(DIR)
++	cp -aL $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/include $(DIR)/arch/$(KERNEL_ARCH)
+ 	find $(DIR) -name '*.cmd' -delete
+ 
+ 	$(CROSS_COMPILE)objcopy -j .BTF -j .BTF_ids $(SOURCE_DIR)/vmlinux $(DIR)/vmlinux
+@@ -369,10 +368,10 @@
+ 
+ 	if [ -f $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/lib/crtsavres.o ]; then \
+ 		mkdir $(DIR)/arch/$(KERNEL_ARCH)/lib; \
+-		cp -a $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/lib/crtsavres.o $(DIR)/arch/$(KERNEL_ARCH)/lib; \
++		cp -aL $(SOURCE_DIR)/arch/$(KERNEL_ARCH)/lib/crtsavres.o $(DIR)/arch/$(KERNEL_ARCH)/lib; \
+ 	fi
+ 
+-	cp -a $(SOURCE_DIR)/scripts/module.lds $(DIR)/arch/$(KERNEL_ARCH)
++	cp -aL $(SOURCE_DIR)/scripts/module.lds $(DIR)/arch/$(KERNEL_ARCH)
+ 
+ 	@echo 'include $(BASE_DIR_COMMON)/Makefile' >> $(DIR)/Makefile
+ 
+@@ -452,11 +451,7 @@
+ binary_image: $(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+ binary_image:
+ 	$(dh_binary_pre)
+-	dh_install --sourcedir=$(DIR2) boot
+-	dh_install --sourcedir=$(DIR2) lib
+-ifneq ($(filter arm64 armel armhf mipsel mips64el mipsr6 mipsr6el mips64r6 mips64r6el riscv64,$(ARCH)),)
+-	dh_install --sourcedir=$(DIR2) usr
+-endif
++	python3 "$(SONIC_KERNEL_DEBUG_STAGE)" --stage-install "$(DESTDIR)" --architecture "$(SONIC_KERNEL_ARCHITECTURE)"
+ 	sed '/CONFIG_\(MODULE_SIG_\(ALL\|KEY\)\|SYSTEM_TRUSTED_KEYS\|BUILD_SALT\)[ =]/d' $(DIR)/.config > $(DESTDIR)/boot/config-$(REAL_VERSION)
+ 	echo "ffffffffffffffff B The real System.map is in the linux-image-<version>-dbg package" \
+ 		> $(DESTDIR)/boot/System.map-$(REAL_VERSION)
+@@ -475,7 +470,7 @@
+ binary_image-dbg: DIR = $(BUILD_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)/output/image-dbg
+ binary_image-dbg: $(STAMPS_DIR)/build_$(ARCH)_$(FEATURESET)_$(FLAVOUR)
+ 	$(dh_binary_pre)
+-	dh_install --sourcedir=$(DIR) boot lib usr/lib/debug
++	python3 "$(SONIC_KERNEL_DEBUG_STAGE)" --stage-install "$(DESTDIR)" --architecture "$(SONIC_KERNEL_ARCHITECTURE)"
+ 
+ # Verify we don't have any signed modules installed
+ 	@if find $(DIR) -name '*.ko' | xargs grep -q '~Module signature appended~'; then \
+@@ -509,9 +504,6 @@
+ 	ln -s boot/vmlinux-$(REAL_VERSION) $(DEBUG_DIR)/
+ 	mkdir -p $(DEBUG_DIR)/lib/modules/$(REAL_VERSION)
+ 	ln -s ../../../boot/vmlinux-$(REAL_VERSION) $(DEBUG_DIR)/lib/modules/$(REAL_VERSION)/vmlinux
+-	if [ -n "$(SONIC_KERNEL_DEBUG_STAGE)" ]; then \
+-		python3 "$(SONIC_KERNEL_DEBUG_STAGE)" "$(CURDIR)" "$(DESTDIR)" "$(SONIC_KERNEL_ARTIFACTS)" --architecture "$(ARCH)"; \
+-	fi
+ 	$(dh_binary_post)
+ 
+ build_signed-template:

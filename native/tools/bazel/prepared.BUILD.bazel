@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "source_files", srcs = glob(["**"], exclude = ["BUILD.bazel"], allow_empty = False))
+exports_files(["Makefile"])
+
+exports_files(glob(["**"], exclude = ["BUILD.bazel"]))
+filegroup(name = "metadata_sources", srcs = glob([
+    "debian/bin/gencontrol.py", "debian/lib/python/**", "debian/config/**", "debian/templates/**",
+    "debian/changelog", "debian/copyright", "debian/README.Debian",
+]))
+filegroup(name = "header_sources", srcs = glob([
+    "Makefile", "arch/*/Makefile*", "arch/**/Kbuild.platforms", "arch/**/Platform",
+    "arch/**/include/**", "arch/**/scripts/**", "include/**",
+]))
+filegroup(name = "script_sources", srcs = glob(["scripts/**"]))
+filegroup(name = "tool_headers", srcs = glob(["tools/**/*.h", "scripts/**/*.h", "include/**/*.h"]))
+filegroup(name = "kbuild_headers", srcs = glob(["debian/rules.d/**/*.h"]))

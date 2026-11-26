@@ -1,0 +1,41 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@sonic_build_infra//tools/build_tools:defs.bzl", "python_runtime")
+
+load(":kernel.bzl", "kernel_config", "kernel_execution")
+
+kernel_execution(name = "kernel_execution")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "prepared.BUILD.bazel",
+    "runtime_metadata.py",
+    "module_action.py",
+    "kernel_action.py",
+    "kernel_arch.py",
+    "stage_kernel.py",
+    "native_install.py",
+    "kbuild_generate.py",
+    "package_layout.py",
+    "package_metadata.py",
+])
+
+kernel_config(
+    name = "kernel_config",
+    build_setting_default = "{}",
+)
+
+python_runtime(name = "python_runtime")
+
+py_test(
+    name = "native_install_test",
+    imports = ["."],
+    srcs = ["native_install_test.py", "native_install.py", "package_layout.py", "package_metadata.py",
+            "kernel_arch.py", "kernel_action.py", "stage_kernel.py"],
+    main = "native_install_test.py",
+)
+py_test(
+    name = "kbuild_generate_test",
+    srcs = ["kbuild_generate_test.py", "kbuild_generate.py"],
+    main = "kbuild_generate_test.py",
+)

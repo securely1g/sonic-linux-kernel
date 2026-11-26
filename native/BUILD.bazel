@@ -1,0 +1,119 @@
+load("//tools/bazel:kernel.bzl", "kernel_packages", "kernel_output", "kernel_runtime_metadata")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    ".github/workflows/bazel.yml",
+    "MODULE.bazel",
+])
+
+_KERNEL_SOURCES = glob([
+    "config.local/**",
+    "patches-debian/**",
+    "patches-sonic/**",
+]) + [
+    "Makefile",
+    "manage-config",
+    "//tools/bazel:kernel_arch.py",
+    "//tools/bazel:stage_kernel.py",
+]
+
+# Execution tools follow the host platform; target CPU selects kernel code.
+[
+    kernel_packages(
+        name = "kernel_packages_" + architecture,
+        srcs = _KERNEL_SOURCES,
+        architecture = architecture,
+        build_tools = "@sonic_build_infra//tools/build_tools:kernel_runtime",
+        debian = "@kernel_debian//file",
+        dsc = "@kernel_dsc//file",
+        exec_compatible_with = [
+            "@platforms//os:linux",
+        ],
+        makefile = "Makefile",
+        orig = "@kernel_orig//file",
+        target_compatible_with = [
+            "@platforms//os:linux",
+            "@platforms//cpu:" + cpu,
+        ],
+    )
+    for architecture, cpu in [
+        ("amd64", "x86_64"),
+        ("arm64", "aarch64"),
+    ]
+]
+
+alias(
+    name = "kernel_packages",
+    actual = select({
+        "@platforms//cpu:x86_64": ":kernel_packages_amd64",
+        "@platforms//cpu:aarch64": ":kernel_packages_arm64",
+    }),
+)
+
+# Consumers can select a Debian package group from the same compiled kernel.
+filegroup(
+    name = "runtime_deb",
+    srcs = [":kernel_packages"],
+    output_group = "runtime",
+)
+
+filegroup(
+    name = "debug_deb",
+    srcs = [":kernel_packages"],
+    output_group = "debug",
+)
+
+filegroup(
+    name = "development_debs",
+    srcs = [":kernel_packages"],
+    output_group = "development",
+)
+
+filegroup(
+    name = "manifest",
+    srcs = [":kernel_packages"],
+    output_group = "manifest",
+)
+
+# The Debian packages and these files come from the same compilation.
+filegroup(
+    name = "kernel_build_outputs",
+    srcs = [":kernel_packages"],
+    output_group = "artifacts",
+)
+
+alias(name = "kernel_artifacts", actual = ":kernel_packages")
+
+# Individual files for boot-image, debug and external-module consumers.
+[
+    kernel_output(
+        name = name,
+        kernel = ":kernel_packages",
+        path = path,
+    )
+    for name, path in [
+        ("image", "image"),
+        ("vmlinux", "vmlinux"),
+        ("System.map", "System.map"),
+        ("config", "config"),
+        ("Module.symvers", "Module.symvers"),
+        ("kernel.release", "kernel.release"),
+    ]
+]
+
+# Finalized staging interfaces use stable binary package basenames.
+filegroup(name = "linux-image.runtime", srcs = [":kernel_packages"], output_group = "runtime_tar")
+filegroup(name = "linux-image.control", srcs = [":kernel_packages"], output_group = "control_tar")
+kernel_runtime_metadata(
+    name = "linux-image.runtime_metadata",
+    kernel = ":kernel_packages",
+    runtime = ":linux-image.runtime",
+    control = ":linux-image.control",
+)
+filegroup(name = "boot", srcs = [":kernel_packages"], output_group = "boot")
+filegroup(name = "kernel_metadata.json", srcs = [":kernel_packages"], output_group = "metadata")
+
+exports_files(glob(["patches-sonic/**", "config.local/**", "patches-debian/**"]))
+
+filegroup(name = "kernel_recipe_sources", srcs = glob(["config.local/**"]))

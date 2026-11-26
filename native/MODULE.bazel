@@ -1,0 +1,22 @@
+module(
+    name = "sonic-linux-kernel",
+    version = "0.0.4",
+)
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "patchelf", version = "0.18.0.bcr.1")
+bazel_dep(name = "rules_python", version = "1.9.0.sonic.1")
+bazel_dep(name = "sonic-build-infra", version = "0.0.45-77ef625a4ddafc8cdc15f3cc6aee31eabac8a5de", repo_name = "sonic_build_infra")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.13")
+
+sources = use_extension("//tools/bazel:sources.bzl", "kernel_sources")
+use_repo(sources, "kernel_debian", "kernel_debian_prepared", "kernel_dsc", "kernel_orig", "kernel_prepared")
+
+# Installation archives and source-built kbuild tools use the existing shared lock.
+bazel_dep(name = "tar.bzl", version = "0.10.5.sonic.2")
+bazel_dep(name = "rules_cc", version = "0.2.20")
+bazel_dep(name = "rules_distroless", version = "0.9.4.sonic.21")
+apt = use_extension("@rules_distroless//apt:extensions.bzl", "apt")
+use_repo(apt, "build_tools")
